@@ -1,6 +1,6 @@
 """
 main.py — Punto de entrada principal.
-Inicia el servidor de health check y luego el bot de Telegram.
+Crea el event loop explícitamente para compatibilidad con Python 3.12+/3.14+
 """
 
 import asyncio
@@ -17,5 +17,10 @@ if __name__ == "__main__":
     # 1. Servidor HTTP para UptimeRobot / Render health checks
     start_health_server()
 
-    # 2. Bot de Telegram — run_polling maneja su propio event loop internamente
+    # 2. Crear e instalar el event loop manualmente antes de run_polling
+    #    Necesario en Python 3.12+ donde ya no se autocrea en el hilo principal
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    # 3. Bot de Telegram
     run_bot()
