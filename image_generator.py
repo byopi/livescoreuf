@@ -1,31 +1,19 @@
 """
-image_generator.py — Genera la imagen de resumen final del partido.
+image_generator.py — Resumen final del partido con Pillow.
 
-Layout rediseñado:
-  ┌──────────────────────────────────────────────────────┐
-  │  NOMBRE DE LA LIGA (centrado, acento verde)           │
-  ├──────────────────────────────────────────────────────┤
-  │  [LOGO LOCAL]   3  —  1   [LOGO VISITANTE]           │
-  │  Equipo Local        Equipo Visitante                 │
-  │               FINAL                                   │
-  ├──────────────────────────────────────────────────────┤
-  │  ESTADÍSTICAS (barras comparativas)                   │
-  │  Posesión          55%  ████████░░  45%              │
-  │  Tiros a puerta     6  ██████░░░░   4                │
-  │  …                                                    │
-  ├──────────────────────────────────────────────────────┤
-  │            [LOGO UNIVERSO FOOTBALL]                   │
-  └──────────────────────────────────────────────────────┘
+Logos: football-logos.cc (con fallback a ESPN CDN)
+Stats: posesion, xG, tiros totales, tiros a puerta, corners, tarjetas
 """
 
 import io
 import os
+import re
 import logging
 from pathlib import Path
 from typing import Optional
 
 import requests
-from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageEnhance
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 logger = logging.getLogger(__name__)
 
@@ -36,164 +24,237 @@ WATERMARK_PATH = str(ASSETS_DIR / "logo_uf.png")
 OUTPUT_DIR     = Path("output_images")
 
 # ─── Paleta ────────────────────────────────────────────────────────────────────
-C_BG        = (18, 20, 24)        # fondo muy oscuro
-C_CARD      = (28, 31, 38)        # tarjeta central
-C_HEADER    = (22, 25, 32)        # cabecera liga
-C_ACCENT    = (0, 210, 110)       # verde neón
-C_WHITE     = (245, 245, 245)
-C_GRAY      = (150, 155, 165)
-C_DIVIDER   = (45, 50, 62)
-C_BAR_LEFT  = (0, 190, 100)       # barra local (verde)
-C_BAR_RIGHT = (210, 55, 55)       # barra visitante (rojo)
-C_SCORE_BG  = (35, 39, 48)        # fondo del recuadro de marcador
+C_BG       = (18, 20, 24)
+C_CARD     = (28, 31, 38)
+C_HEADER   = (22, 25, 32)
+C_ACCENT   = (0, 210, 110)
+C_WHITE    = (245, 245, 245)
+C_GRAY     = (140, 145, 158)
+C_DIVIDER  = (42, 47, 60)
+C_BAR_L    = (0, 190, 100)
+C_BAR_R    = (210, 55, 55)
+C_SCORE_BG = (35, 39, 50)
 
 # ─── Dimensiones ───────────────────────────────────────────────────────────────
-W, H         = 1080, 720
-LOGO_SIZE    = (140, 140)
-BAR_H        = 14
-BAR_RADIUS   = 7
-CARD_MARGIN  = 30
-CARD_RADIUS  = 20
+W, H         = 1080, 740
+LOGO_SIZE    = (130, 130)
+BAR_H        = 13
+BAR_R        = 6
+CARD_M       = 28
+CARD_R       = 18
 
-STATS_TO_SHOW = [
-    ("Posesión",          True),   # (nombre, es_porcentaje)
-    ("Tiros a puerta",    False),
-    ("Tiros totales",     False),
-    ("Córners",           False),
-    ("Faltas",            False),
-    ("Tarjetas amarillas",False),
+HTTP_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; UniversoFootballBot/1.0)",
+    "Accept": "text/html,application/xhtml+xml,*/*",
+}
+
+STATS_ORDER = [
+    ("Posesion",          True,  "Posesión"),
+    ("xG",                False, "xG"),
+    ("Tiros totales",     False, "Tiros totales"),
+    ("Tiros a puerta",    False, "Tiros a puerta"),
+    ("Corners",           False, "Córners"),
+    ("Tarjetas",          False, "Tarjetas"),
 ]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# HELPERS
+# BÚSQUEDA DE LOGOS EN FOOTBALL-LOGOS.CC
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _slugify(name: str) -> str:
+    """Convierte 'Real Madrid CF' → 'real-madrid-cf'"""
+    name = name.lower().strip()
+    name = re.sub(r"[^\w\s-]", "", name)
+    name = re.sub(r"[\s_]+", "-", name)
+    return name
+
+
+def _search_football_logos(team_name: str) -> Optional[str]:
+    """
+    Busca el logo en football-logos.cc usando la búsqueda del sitio.
+    Devuelve la URL directa del PNG 256x256 o None si no se encuentra.
+    """
+    slug = _slugify(team_name)
+    # Intentar URL directa primero (patrón más común)
+    # El sitio usa: /search/?q=<nombre>
+    try:
+        search_url = f"https://football-logos.cc/search/?q={requests.utils.quote(team_name)}"
+        r = requests.get(search_url, headers=HTTP_HEADERS, timeout=10)
+        r.raise_for_status()
+        html = r.text
+
+        # Buscar URLs de imágenes PNG en el HTML
+        pattern = r'https://assets\.football-logos\.cc/logos/[^"\']+256x256/[^"\']+\.png'
+        matches = re.findall(pattern, html)
+
+        if matches:
+            logger.info("Logo encontrado en football-logos.cc para: %s", team_name)
+            return matches[0]
+
+        # Si no encuentra, intentar con slug directamente
+        # Buscar cualquier imagen en los resultados
+        pattern2 = r'https://assets\.football-logos\.cc/logos/[^"\']+\.png'
+        matches2 = re.findall(pattern2, html)
+        if matches2:
+            return matches2[0]
+
+    except Exception as exc:
+        logger.debug("Error buscando en football-logos.cc '%s': %s", team_name, exc)
+
+    return None
+
+
+def _get_logo(team_name: str, fallback_url: str = "") -> Optional[Image.Image]:
+    """
+    Obtiene el logo del equipo:
+    1. Busca en football-logos.cc
+    2. Fallback a URL de ESPN si no encuentra
+    """
+    # Intentar football-logos.cc
+    logo_url = _search_football_logos(team_name)
+
+    # Fallback a ESPN CDN
+    if not logo_url and fallback_url:
+        logo_url = fallback_url
+        logger.debug("Usando logo de ESPN para: %s", team_name)
+
+    if not logo_url:
+        return None
+
+    try:
+        r = requests.get(logo_url, headers=HTTP_HEADERS, timeout=10)
+        r.raise_for_status()
+        img = Image.open(io.BytesIO(r.content)).convert("RGBA")
+        img = img.resize(LOGO_SIZE, Image.LANCZOS)
+        return img
+    except Exception as exc:
+        logger.warning("Error descargando logo %s: %s", logo_url, exc)
+        return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PARSEO DE ESTADÍSTICAS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _parse_stats(raw_stats: list[dict]) -> tuple[dict, dict]:
+    """
+    Acepta tanto claves en español (del bot) como en inglés (ESPN raw).
+    Agrupa tarjetas amarillas + rojas en una sola clave "Tarjetas".
+    """
+    MAP = {
+        # Español
+        "Posesion":          "Posesion",
+        "Posesión":          "Posesion",
+        "xG":                "xG",
+        "Tiros totales":     "Tiros totales",
+        "Tiros a puerta":    "Tiros a puerta",
+        "Corners":           "Corners",
+        "Tarjetas amarillas":"Tarjetas",
+        "Tarjetas rojas":    "Tarjetas",
+        # Inglés ESPN
+        "possessionPct":     "Posesion",
+        "expectedGoals":     "xG",
+        "totalShots":        "Tiros totales",
+        "shotsOnTarget":     "Tiros a puerta",
+        "corners":           "Corners",
+        "yellowCards":       "Tarjetas",
+        "redCards":          "Tarjetas",
+    }
+    home_s: dict = {}
+    away_s: dict = {}
+
+    for i, block in enumerate(raw_stats[:2]):
+        dest = home_s if i == 0 else away_s
+        for stat in block.get("statistics", []):
+            key = MAP.get(stat.get("type", ""))
+            if not key:
+                continue
+            raw = stat.get("value", 0)
+            if raw is None:
+                val = 0.0
+            elif isinstance(raw, str):
+                val = float(raw.replace("%", "").strip() or 0)
+            else:
+                try:
+                    val = float(raw)
+                except (TypeError, ValueError):
+                    val = 0.0
+            # Sumar tarjetas (amarillas + rojas)
+            dest[key] = dest.get(key, 0.0) + val
+
+    return home_s, away_s
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HELPERS DE DIBUJO
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _font(size: int) -> ImageFont.FreeTypeFont:
     try:
         return ImageFont.truetype(FONT_PATH, size)
     except (IOError, OSError):
-        logger.warning("Fuente TTF no encontrada. Usando fuente por defecto.")
         return ImageFont.load_default()
 
 
-def _download_logo(url: str, size: tuple) -> Optional[Image.Image]:
-    if not url:
-        return None
-    try:
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-        img = Image.open(io.BytesIO(r.content)).convert("RGBA")
-        img = img.resize(size, Image.LANCZOS)
-        return img
-    except Exception as exc:
-        logger.warning("Error descargando logo %s: %s", url, exc)
-        return None
+def _rr(draw: ImageDraw.Draw, xy, r: int, fill, outline=None, ow=0):
+    draw.rounded_rectangle(xy, radius=r, fill=fill, outline=outline, width=ow)
 
 
-def _rounded_rect(draw: ImageDraw.Draw, xy, radius: int, fill, outline=None, outline_width=0):
-    draw.rounded_rectangle(xy, radius=radius, fill=fill, outline=outline, width=outline_width)
-
-
-def _text_centered(draw: ImageDraw.Draw, text: str, font, y: int, color, width: int = W):
+def _centered_text(draw: ImageDraw.Draw, text: str, font, y: int, color,
+                   canvas_w: int = W):
     tw = draw.textlength(text, font=font)
-    draw.text(((width - tw) / 2, y), text, font=font, fill=color)
-    return tw
-
-
-def _logo_placeholder(draw: ImageDraw.Draw, x: int, y: int, size: tuple, label: str):
-    """Círculo de fallback cuando no hay logo disponible."""
-    r = min(size) // 2
-    cx, cy = x + size[0] // 2, y + size[1] // 2
-    draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=C_DIVIDER)
-    f = _font(18)
-    initials = "".join(w[0].upper() for w in label.split()[:2])
-    tw = draw.textlength(initials, font=f)
-    draw.text((cx - tw / 2, cy - 12), initials, font=f, fill=C_WHITE)
+    draw.text(((canvas_w - tw) / 2, y), text, font=font, fill=color)
 
 
 def _paste_logo(canvas: Image.Image, logo: Optional[Image.Image],
-                draw: ImageDraw.Draw, x: int, y: int, size: tuple, label: str):
+                draw: ImageDraw.Draw, x: int, y: int, label: str):
     if logo:
-        # Sombra suave detrás del logo
-        shadow = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
-        sh_draw = ImageDraw.Draw(shadow)
-        r = min(size) // 2 + 6
-        cx, cy = x + size[0] // 2, y + size[1] // 2
-        sh_draw.ellipse([cx - r + 4, cy - r + 4, cx + r + 4, cy + r + 4],
-                        fill=(0, 0, 0, 80))
-        shadow = shadow.filter(ImageFilter.GaussianBlur(8))
-        canvas.alpha_composite(shadow)
+        # Sombra
+        sh = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+        sd = ImageDraw.Draw(sh)
+        r  = LOGO_SIZE[0] // 2 + 5
+        cx = x + LOGO_SIZE[0] // 2
+        cy = y + LOGO_SIZE[1] // 2
+        sd.ellipse([cx-r+5, cy-r+5, cx+r+5, cy+r+5], fill=(0,0,0,70))
+        sh = sh.filter(ImageFilter.GaussianBlur(8))
+        canvas.alpha_composite(sh)
         canvas.paste(logo, (x, y), logo)
     else:
-        _logo_placeholder(draw, x, y, size, label)
+        # Placeholder
+        r  = min(LOGO_SIZE) // 2
+        cx = x + LOGO_SIZE[0] // 2
+        cy = y + LOGO_SIZE[1] // 2
+        draw.ellipse([cx-r, cy-r, cx+r, cy+r], fill=C_DIVIDER)
+        f  = _font(20)
+        init = "".join(w[0].upper() for w in label.split()[:2])
+        iw = draw.textlength(init, font=f)
+        draw.text((cx - iw/2, cy - 13), init, font=f, fill=C_WHITE)
 
 
-def _draw_stat_bar(draw: ImageDraw.Draw,
-                   x: int, y: int, bar_w: int,
-                   val_h: float, val_a: float,
-                   label: str, is_pct: bool,
-                   f_label, f_val):
-    total = val_h + val_a
-    ratio = val_h / total if total > 0 else 0.5
+def _draw_bar(draw: ImageDraw.Draw, x: int, y: int, bar_w: int,
+              vh: float, va: float, label_es: str, is_pct: bool,
+              f_lbl, f_val):
+    total = vh + va
+    rh = vh / total if total > 0 else 0.5
 
-    home_w = max(int(bar_w * ratio), 4)
-    away_w = max(bar_w - home_w, 4)
+    hw = max(int(bar_w * rh), 4)
+    aw = max(bar_w - hw, 4)
 
-    # Label centrado
-    lw = draw.textlength(label, font=f_label)
-    draw.text((x + bar_w / 2 - lw / 2, y), label, font=f_label, fill=C_GRAY)
+    # Label
+    lw = draw.textlength(label_es, font=f_lbl)
+    draw.text((x + bar_w/2 - lw/2, y), label_es, font=f_lbl, fill=C_GRAY)
     y += 20
 
-    # Barra local (izquierda → derecha, verde)
-    _rounded_rect(draw, (x, y, x + home_w - 2, y + BAR_H), BAR_RADIUS, C_BAR_LEFT)
-    # Barra visitante (derecha, rojo)
-    _rounded_rect(draw, (x + home_w + 2, y, x + bar_w, y + BAR_H), BAR_RADIUS, C_BAR_RIGHT)
+    _rr(draw, (x, y, x + hw - 2, y + BAR_H), BAR_R, C_BAR_L)
+    _rr(draw, (x + hw + 2, y, x + bar_w, y + BAR_H), BAR_R, C_BAR_R)
 
-    # Valores
-    suffix = "%" if is_pct else ""
-    v_h = f"{int(val_h)}{suffix}"
-    v_a = f"{int(val_a)}{suffix}"
-    draw.text((x, y + BAR_H + 5), v_h, font=f_val, fill=C_WHITE)
-    aw = draw.textlength(v_a, font=f_val)
-    draw.text((x + bar_w - aw, y + BAR_H + 5), v_a, font=f_val, fill=C_WHITE)
-
-
-def _parse_stats(raw_stats: list[dict]) -> tuple[dict, dict]:
-    NAME_MAP = {
-        "Posesión":           "Posesión",
-        "Tiros a puerta":     "Tiros a puerta",
-        "Tiros totales":      "Tiros totales",
-        "Córners":            "Córners",
-        "Faltas":             "Faltas",
-        "Tarjetas amarillas": "Tarjetas amarillas",
-        # También acepta claves en inglés por si viene de image_generator directamente
-        "Shots on Goal":      "Tiros a puerta",
-        "Total Shots":        "Tiros totales",
-        "Corner Kicks":       "Córners",
-        "Fouls":              "Faltas",
-        "Yellow Cards":       "Tarjetas amarillas",
-        "Ball Possession":    "Posesión",
-    }
-    home_s: dict = {}
-    away_s: dict = {}
-    for i, block in enumerate(raw_stats[:2]):
-        dest = home_s if i == 0 else away_s
-        for stat in block.get("statistics", []):
-            key = NAME_MAP.get(stat.get("type", ""))
-            if not key:
-                continue
-            raw = stat.get("value", 0)
-            if raw is None:
-                dest[key] = 0.0
-            elif isinstance(raw, str):
-                dest[key] = float(raw.replace("%", "").strip() or 0)
-            else:
-                try:
-                    dest[key] = float(raw)
-                except (TypeError, ValueError):
-                    dest[key] = 0.0
-    return home_s, away_s
+    suf = "%" if is_pct else ""
+    vhs = f"{int(vh)}{suf}"
+    vas = f"{int(va)}{suf}"
+    draw.text((x, y + BAR_H + 5), vhs, font=f_val, fill=C_WHITE)
+    vaw = draw.textlength(vas, font=f_val)
+    draw.text((x + bar_w - vaw, y + BAR_H + 5), vas, font=f_val, fill=C_WHITE)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -201,151 +262,123 @@ def _parse_stats(raw_stats: list[dict]) -> tuple[dict, dict]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def generate_match_summary(fixture_data: dict, raw_stats: list[dict]) -> str:
-    """
-    Genera y guarda la imagen de resumen. Devuelve la ruta del PNG.
-    """
     home_name  = fixture_data["teams"]["home"]["name"]
     away_name  = fixture_data["teams"]["away"]["name"]
     home_score = fixture_data["goals"]["home"] or 0
     away_score = fixture_data["goals"]["away"] or 0
     league     = fixture_data["league"]["name"]
-    home_logo_url = fixture_data["teams"]["home"].get("logo", "")
-    away_logo_url = fixture_data["teams"]["away"].get("logo", "")
+    home_logo_fallback = fixture_data["teams"]["home"].get("logo", "")
+    away_logo_fallback = fixture_data["teams"]["away"].get("logo", "")
 
-    home_stats, away_stats = _parse_stats(raw_stats)
+    home_s, away_s = _parse_stats(raw_stats)
 
-    # ── Canvas base ────────────────────────────────────────────────────────
+    # ── Logos ──────────────────────────────────────────────────────────────
+    home_logo = _get_logo(home_name, home_logo_fallback)
+    away_logo = _get_logo(away_name, away_logo_fallback)
+
+    # ── Canvas ─────────────────────────────────────────────────────────────
     canvas = Image.new("RGBA", (W, H), C_BG)
     draw   = ImageDraw.Draw(canvas)
 
-    # ── Tarjeta principal ──────────────────────────────────────────────────
-    _rounded_rect(draw,
-                  (CARD_MARGIN, CARD_MARGIN, W - CARD_MARGIN, H - CARD_MARGIN),
-                  CARD_RADIUS, C_CARD)
-
     # ── Fuentes ────────────────────────────────────────────────────────────
-    f_league  = _font(22)
-    f_score   = _font(96)
-    f_team    = _font(26)
-    f_final   = _font(18)
-    f_label   = _font(16)
-    f_val     = _font(14)
-    f_brand   = _font(15)
+    f_league = _font(21)
+    f_score  = _font(92)
+    f_team   = _font(24)
+    f_final  = _font(17)
+    f_label  = _font(16)
+    f_val    = _font(14)
+    f_brand  = _font(14)
 
-    # ── Cabecera liga ──────────────────────────────────────────────────────
-    header_h = 54
-    _rounded_rect(draw,
-                  (CARD_MARGIN, CARD_MARGIN,
-                   W - CARD_MARGIN, CARD_MARGIN + header_h),
-                  CARD_RADIUS, C_HEADER)
-    _text_centered(draw, league.upper(), f_league,
-                   CARD_MARGIN + (header_h - 22) // 2, C_ACCENT)
+    # ── Tarjeta ────────────────────────────────────────────────────────────
+    _rr(draw, (CARD_M, CARD_M, W-CARD_M, H-CARD_M), CARD_R, C_CARD)
 
-    # ── Descargar logos (en paralelo sería ideal, pero requests es sync) ───
-    home_logo = _download_logo(home_logo_url, LOGO_SIZE)
-    away_logo = _download_logo(away_logo_url, LOGO_SIZE)
+    # ── Cabecera ───────────────────────────────────────────────────────────
+    HDR_H = 52
+    _rr(draw, (CARD_M, CARD_M, W-CARD_M, CARD_M+HDR_H), CARD_R, C_HEADER)
+    _centered_text(draw, league.upper(), f_league, CARD_M + (HDR_H-21)//2, C_ACCENT)
 
-    # ── Zona central: logos + marcador ────────────────────────────────────
-    zone_top = CARD_MARGIN + header_h + 20
-    logo_y   = zone_top
+    # ── Logos y nombres ────────────────────────────────────────────────────
+    LOGO_Y   = CARD_M + HDR_H + 18
+    HOME_X   = CARD_M + 45
+    AWAY_X   = W - CARD_M - 45 - LOGO_SIZE[0]
+    HOME_CX  = HOME_X + LOGO_SIZE[0] // 2
+    AWAY_CX  = AWAY_X + LOGO_SIZE[0] // 2
 
-    logo_home_x = CARD_MARGIN + 40
-    logo_away_x = W - CARD_MARGIN - 40 - LOGO_SIZE[0]
+    _paste_logo(canvas, home_logo, draw, HOME_X, LOGO_Y, home_name)
+    _paste_logo(canvas, away_logo, draw, AWAY_X, LOGO_Y, away_name)
 
-    _paste_logo(canvas, home_logo, draw, logo_home_x, logo_y, LOGO_SIZE, home_name)
-    _paste_logo(canvas, away_logo, draw, logo_away_x, logo_y, LOGO_SIZE, away_name)
+    NAME_Y = LOGO_Y + LOGO_SIZE[1] + 8
+    fh = _font(22 if len(home_name) <= 14 else 17)
+    fa = _font(22 if len(away_name) <= 14 else 17)
 
-    # Nombres de equipo bajo los logos
-    name_y = logo_y + LOGO_SIZE[1] + 8
-    f_team_home = _font(24 if len(home_name) <= 14 else 18)
-    f_team_away = _font(24 if len(away_name) <= 14 else 18)
+    hw = draw.textlength(home_name, font=fh)
+    draw.text((HOME_CX - hw/2, NAME_Y), home_name, font=fh, fill=C_WHITE)
+    aw = draw.textlength(away_name, font=fa)
+    draw.text((AWAY_CX - aw/2, NAME_Y), away_name, font=fa, fill=C_WHITE)
 
-    home_cx = logo_home_x + LOGO_SIZE[0] // 2
-    away_cx = logo_away_x + LOGO_SIZE[0] // 2
-
-    hw = draw.textlength(home_name, font=f_team_home)
-    draw.text((home_cx - hw / 2, name_y), home_name, font=f_team_home, fill=C_WHITE)
-
-    aw = draw.textlength(away_name, font=f_team_away)
-    draw.text((away_cx - aw / 2, name_y), away_name, font=f_team_away, fill=C_WHITE)
-
-    # ── Marcador central ───────────────────────────────────────────────────
-    score_str = f"{home_score}  {away_score}"
+    # ── Marcador ───────────────────────────────────────────────────────────
+    score_str = f"{home_score}   {away_score}"
     sw = draw.textlength(score_str, font=f_score)
-    score_x = (W - sw) / 2
-    score_y = logo_y + 10
+    SX = (W - sw) / 2
+    SY = LOGO_Y + 8
 
-    # Fondo del marcador
-    pad = 18
-    _rounded_rect(draw,
-                  (score_x - pad, score_y - 8,
-                   score_x + sw + pad, score_y + 90),
-                  12, C_SCORE_BG)
+    _rr(draw, (SX-16, SY-6, SX+sw+16, SY+86), 10, C_SCORE_BG)
 
-    # Guión separador entre números
-    dash_x = W / 2
-    dash_y = score_y + 30
-    draw.text((dash_x - 10, dash_y), "—", font=_font(36), fill=C_GRAY)
+    # Guion separador
+    gw = draw.textlength("-", font=_font(34))
+    draw.text(((W-gw)/2, SY+28), "-", font=_font(34), fill=C_GRAY)
 
-    # Números del marcador
-    draw.text((score_x, score_y), score_str, font=f_score, fill=C_WHITE)
+    draw.text((SX, SY), score_str, font=f_score, fill=C_WHITE)
 
-    # Etiqueta FINAL
-    final_y = score_y + 94
-    _text_centered(draw, "FINAL", f_final, final_y, C_ACCENT)
+    # FINAL label
+    _centered_text(draw, "FINAL", f_final, SY + 90, C_ACCENT)
 
     # ── Divisor ────────────────────────────────────────────────────────────
-    div_y = name_y + 42
-    draw.line([(CARD_MARGIN + 20, div_y), (W - CARD_MARGIN - 20, div_y)],
-              fill=C_DIVIDER, width=1)
+    DIV_Y = NAME_Y + 40
+    draw.line([(CARD_M+18, DIV_Y), (W-CARD_M-18, DIV_Y)], fill=C_DIVIDER, width=1)
 
     # ── Estadísticas ───────────────────────────────────────────────────────
-    stats_x    = CARD_MARGIN + 60
-    bar_total  = W - (CARD_MARGIN + 60) * 2
-    stats_top  = div_y + 18
-    row_height = 54
+    BAR_X   = CARD_M + 55
+    BAR_W   = W - (CARD_M + 55) * 2
+    STATS_Y = DIV_Y + 16
+    ROW_H   = 52
 
-    for i, (stat_key, is_pct) in enumerate(STATS_TO_SHOW):
-        val_h = home_stats.get(stat_key, 0.0)
-        val_a = away_stats.get(stat_key, 0.0)
-        if val_h == 0 and val_a == 0:
+    drawn = 0
+    for key, is_pct, label_es in STATS_ORDER:
+        vh = home_s.get(key, 0.0)
+        va = away_s.get(key, 0.0)
+        if vh == 0.0 and va == 0.0:
             continue
-        _draw_stat_bar(
-            draw, stats_x, stats_top + i * row_height, bar_total,
-            val_h, val_a, stat_key, is_pct,
-            f_label, f_val,
-        )
+        _draw_bar(draw, BAR_X, STATS_Y + drawn * ROW_H, BAR_W,
+                  vh, va, label_es, is_pct, f_label, f_val)
+        drawn += 1
 
-    # ── Marca de agua (logo Universo Football) ─────────────────────────────
-    wm_h   = 52
-    wm_y   = H - CARD_MARGIN - wm_h - 8
+    # ── Marca de agua ──────────────────────────────────────────────────────
+    WM_H = 50
+    WM_Y = H - CARD_M - WM_H - 6
 
     if os.path.exists(WATERMARK_PATH):
         try:
-            wm = Image.open(WATERMARK_PATH).convert("RGBA")
-            ratio = wm_h / wm.height
+            wm   = Image.open(WATERMARK_PATH).convert("RGBA")
+            ratio = WM_H / wm.height
             wm_w  = int(wm.width * ratio)
-            wm    = wm.resize((wm_w, wm_h), Image.LANCZOS)
-
-            # Aumentar contraste y aplicar transparencia
+            wm    = wm.resize((wm_w, WM_H), Image.LANCZOS)
             r, g, b, a = wm.split()
             a = a.point(lambda p: int(p * 0.88))
             wm.putalpha(a)
-
-            wm_x = (W - wm_w) // 2
-            canvas.alpha_composite(wm, (wm_x, wm_y))
+            canvas.alpha_composite(wm, ((W - wm_w) // 2, WM_Y))
         except Exception as exc:
-            logger.warning("Error pegando marca de agua: %s", exc)
+            logger.warning("Error marca de agua: %s", exc)
     else:
         brand = "t.me/iUniversoFootball"
         bw    = draw.textlength(brand, font=f_brand)
-        draw.text(((W - bw) / 2, wm_y + 10), brand, font=f_brand, fill=C_ACCENT)
+        draw.text(((W-bw)/2, WM_Y+10), brand, font=f_brand, fill=C_ACCENT)
 
     # ── Guardar ────────────────────────────────────────────────────────────
     OUTPUT_DIR.mkdir(exist_ok=True)
-    fid        = fixture_data["fixture"].get("id", "test")
-    out_path   = str(OUTPUT_DIR / f"match_{fid}.png")
+    fid      = fixture_data["fixture"].get("id", "test")
+    out_path = str(OUTPUT_DIR / f"match_{fid}.png")
     canvas.convert("RGB").save(out_path, "PNG", optimize=True)
     logger.info("Imagen guardada: %s", out_path)
     return out_path
-    
+  
