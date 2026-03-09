@@ -1100,6 +1100,7 @@ async def _run_test(event_id: str, slug: Optional[str], message: Message):
 
 async def cb_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    # Responder INMEDIATAMENTE antes de cualquier operación lenta
     await query.answer()
     if query.from_user.id != ADMIN_ID:
         return
@@ -1110,62 +1111,69 @@ async def cb_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if fid in tracked:
         tracked.pop(fid)
-        await query.answer("Partido desactivado.", show_alert=True)
+        label_feedback = "Partido desactivado."
     else:
         try:
             events = await fetch_scoreboard(slug)
             raw = next((e for e in events if e["id"] == fid), None)
-            if raw:
-                raw["_slug"]   = slug
-                raw["_league"] = next((n for n, s in ESPN_LEAGUES.items() if s == slug), slug)
-                p = parse_event(raw)
-                # Intentar obtener ID de Sofascore para livescore
-                sf_id = None
-                try:
-                    sf_id = find_sofascore_match_id(p["home_name"], p["away_name"])
-                except Exception:
-                    pass
-                tracked[fid] = TrackedFixture(
-                    fixture_id    = fid,
-                    league_slug   = slug,
-                    home_name     = p["home_name"],
-                    away_name     = p["away_name"],
-                    league_name   = raw["_league"],
-                    kickoff_utc   = p["kickoff_utc"],
-                    home_score    = p["home_score"],
-                    away_score    = p["away_score"],
-                    status        = p["status_type"],
-                    _sofascore_id = str(sf_id) if sf_id else None,
-                )
-                await query.answer(f"Activado: {p['home_name']} vs {p['away_name']}", show_alert=True)
-            else:
-                await query.answer("No se encontro el partido.", show_alert=True)
+            if not raw:
+                await query.edit_message_text("No se encontró el partido. Intenta /partidos de nuevo.")
                 return
+            raw["_slug"]   = slug
+            raw["_league"] = next((n for n, s in ESPN_LEAGUES.items() if s == slug), slug)
+            p = parse_event(raw)
+
+            # Buscar ID de Sofascore en background sin bloquear
+            loop = asyncio.get_running_loop()
+            sf_id = None
+            try:
+                sf_id = await loop.run_in_executor(
+                    _executor, find_sofascore_match_id, p["home_name"], p["away_name"]
+                )
+            except Exception:
+                pass
+
+            tracked[fid] = TrackedFixture(
+                fixture_id    = fid,
+                league_slug   = slug,
+                home_name     = p["home_name"],
+                away_name     = p["away_name"],
+                league_name   = raw["_league"],
+                kickoff_utc   = p["kickoff_utc"],
+                home_score    = p["home_score"],
+                away_score    = p["away_score"],
+                status        = p["status_type"],
+                _sofascore_id = str(sf_id) if sf_id else None,
+            )
+            label_feedback = f"Activado: {p['home_name']} vs {p['away_name']}"
         except Exception as exc:
             logger.error("cb_toggle error: %s", exc)
-            await query.answer("Error al activar.", show_alert=True)
+            await query.edit_message_text(f"Error al activar: {exc}")
             return
 
-    # Refrescar teclado de la liga
-    try:
-        events = await fetch_scoreboard(slug)
-        keyboard = []
-        for ev in events:
-            ev["_slug"]   = slug
-            ev["_league"] = ""
-            p   = parse_event(ev)
-            act = "OK " if p["id"] in tracked else ""
-            hora = p["kickoff_str"] or "--:--"
-            label = f"{act}{hora} | {p['home_name']} vs {p['away_name']} ({p['home_score']}-{p['away_score']}) {p['status_desc']}"
-            keyboard.append([InlineKeyboardButton(label, callback_data=f"tog:{p['id']}:{slug}")])
-        await query.edit_message_reply_markup(InlineKeyboardMarkup(keyboard))
-    except Exception:
-        pass
+    # Refrescar teclado en background para no bloquear la respuesta
+    async def _refresh_keyboard():
+        try:
+            events = await fetch_scoreboard(slug)
+            keyboard = []
+            for ev in events:
+                ev["_slug"]   = slug
+                ev["_league"] = ""
+                p   = parse_event(ev)
+                act = "✅ " if p["id"] in tracked else ""
+                hora = p["kickoff_str"] or "--:--"
+                label = f"{act}{hora} | {p['home_name']} vs {p['away_name']} ({p['home_score']}-{p['away_score']}) {p['status_desc']}"
+                keyboard.append([InlineKeyboardButton(label, callback_data=f"tog:{p['id']}:{slug}")])
+            await query.edit_message_reply_markup(InlineKeyboardMarkup(keyboard))
+        except Exception:
+            pass
+
+    asyncio.create_task(_refresh_keyboard())
 
 
 async def cb_test(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer("Generando preview...")
+    await query.answer()   # responder inmediatamente
     if query.from_user.id != ADMIN_ID:
         return
     parts = query.data.split(":")
@@ -1225,126 +1233,6 @@ async def cmd_lineup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Selecciona partido para forzar alineaciones:",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
-
-
-async def cb_lineup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.from_user.id != ADMIN_ID:
-        return
-    fid = query.data.split(":")[1]
-    ctx.args = [fid]
-    # Reusar cmd_lineup pasando el fid directamente
-    fix = tracked.get(fid)
-    if not fix:
-        await query.edit_message_text(f"Partido {fid} ya no está activo.")
-        return
-    await query.edit_message_text(f"Obteniendo alineaciones de {fix.home_name} vs {fix.away_name}...")
-    summary = await fetch_summary(fix.league_slug, fid)
-    if not summary:
-        await query.edit_message_text("No se pudo obtener el summary de ESPN.")
-        return
-    home_xi, away_xi, home_formation, away_formation, home_logo_url, away_logo_url = parse_lineups(summary)
-    if len(home_xi) < 11 or len(away_xi) < 11:
-        await query.edit_message_text(
-            f"Alineaciones incompletas ({len(home_xi)} + {len(away_xi)} jugadores).\n"
-            f"ESPN aún no publicó los XI."
-        )
-        return
-    caption = msg_lineup(fix.league_name, fix.home_name, fix.away_name, home_xi, away_xi)
-    dest = CHANNEL_ID if CHANNEL_ID else ADMIN_ID
-    await _send_lineup_images(
-        ctx.application, dest,
-        fix.home_name, fix.away_name,
-        home_xi, away_xi,
-        home_formation, away_formation,
-        home_logo_url, away_logo_url,
-        fix.league_name, fid, caption,
-    )
-    fix.lineup_sent = True
-    await query.edit_message_text(f"✅ Alineaciones enviadas: {fix.home_name} vs {fix.away_name}")
-
-
-@admin_only
-async def cmd_lineup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """
-    /lineup [event_id] — Fuerza el envío de alineaciones al canal.
-
-    Sin argumentos: muestra los partidos monitoreados para elegir.
-    Con event_id:   busca las alineaciones y las envía inmediatamente
-                    ignorando si ya se enviaron antes (útil si falló).
-    """
-    args = ctx.args
-
-    # Sin argumento → mostrar botones con partidos activos
-    if not args:
-        if not tracked:
-            await update.message.reply_text("No hay partidos monitoreados. Usa /partidos para activar uno.")
-            return
-        keyboard = []
-        for fid, fix in tracked.items():
-            hora = fix.kickoff_utc.astimezone(TZ).strftime("%H:%M") if fix.kickoff_utc else "--:--"
-            sent = "✓ " if fix.lineup_sent else ""
-            label = f"{sent}{hora} | {fix.home_name} vs {fix.away_name} ({fix.league_name})"
-            keyboard.append([InlineKeyboardButton(label, callback_data=f"lin:{fid}")])
-        await update.message.reply_text(
-            "Selecciona el partido para enviar alineaciones:",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-        )
-        return
-
-    # Con event_id → forzar envío directamente
-    fid = args[0].strip()
-    await _force_lineup(fid, update.message, ctx.application)
-
-
-async def _force_lineup(fid: str, reply_to, app):
-    """Lógica compartida entre /lineup y el callback inline."""
-    # Buscar en tracked o intentar con slug conocido
-    fix = tracked.get(fid)
-    if fix:
-        slug        = fix.league_slug
-        home_name   = fix.home_name
-        away_name   = fix.away_name
-        league_name = fix.league_name
-        logo_home   = ""
-        logo_away   = ""
-    else:
-        await reply_to.reply_text(f"Partido {fid} no está en seguimiento. Actívalo primero con /partidos.")
-        return
-
-    msg = await reply_to.reply_text(f"Obteniendo alineaciones de {home_name} vs {away_name}...")
-
-    summary = await fetch_summary(slug, fid)
-    if not summary:
-        await msg.edit_text("ESPN no devolvió datos para este partido.")
-        return
-
-    home_xi, away_xi, home_formation, away_formation, logo_home, logo_away = parse_lineups(summary)
-
-    if len(home_xi) < 11 or len(away_xi) < 11:
-        await msg.edit_text(
-            f"Alineaciones incompletas (local: {len(home_xi)}/11, visita: {len(away_xi)}/11). "
-            "Es posible que ESPN aún no las haya publicado."
-        )
-        return
-
-    await msg.edit_text("Generando imágenes...")
-    caption = msg_lineup(league_name, home_name, away_name, home_xi, away_xi)
-    dest    = CHANNEL_ID if CHANNEL_ID else ADMIN_ID
-
-    await _send_lineup_images(
-        app, dest, home_name, away_name,
-        home_xi, away_xi, home_formation, away_formation,
-        logo_home, logo_away, league_name, fid, caption,
-    )
-
-    # Marcar como enviado para que el loop no lo duplique
-    if fid in tracked:
-        tracked[fid].lineup_sent = True
-
-    destino = "el canal" if CHANNEL_ID else "tu DM"
-    await msg.edit_text(f"✅ Alineaciones enviadas a {destino}.")
 
 
 async def cb_lineup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
