@@ -51,38 +51,48 @@ ESPN_HEADERS    = {
 }
 
 ESPN_LEAGUES = {
-    # Alemania
-    "Bundesliga":             "ger.1",
-    "DFB-Pokal":              "ger.dfb_pokal",
-    # España
-    "La Liga":                "esp.1",
-    "Copa del Rey":           "esp.copa_del_rey",
-    "Supercopa de Espana":    "esp.super_cup",
-    # Francia
-    "Ligue 1":                "fra.1",
-    "Coupe de France":        "fra.coupe_de_france",
-    # Inglaterra
-    "Premier League":         "eng.1",
-    "FA Cup":                 "eng.fa",
-    "EFL Cup":                "eng.league_cup",
-    "Community Shield":       "eng.community_shield",
-    # Italia
-    "Serie A":                "ita.1",
-    "Coppa Italia":           "ita.coppa_italia",
-    # UEFA
-    "Champions League":       "uefa.champions",
-    "Europa League":          "uefa.europa",
-    "Conference League":      "uefa.europa.conf",
-    "Nations League":         "uefa.nations",
-    # Selecciones
-    "Mundial FIFA":           "fifa.world",
-    "Eurocopa":               "uefa.euro",
-    "Copa America":           "conmebol.america",
-    "Eliminatorias CONMEBOL": "conmebol.worldq",
-    # Sudamerica
-    "Copa Libertadores":      "conmebol.libertadores",
-    "Copa Sudamericana":      "conmebol.sudamericana",
-    "Recopa Sudamericana":    "conmebol.recopa",
+    # ── Italia ─────────────────────────────────────────────────────────────
+    "Serie A":                  "ita.1",
+    "Coppa Italia":             "ita.coppa_italia",
+    "Supercopa de Italia":      "ita.super_cup",
+    # ── España ─────────────────────────────────────────────────────────────
+    "La Liga":                  "esp.1",
+    "Copa del Rey":             "esp.copa_del_rey",
+    "Supercopa de España":      "esp.super_cup",
+    # ── Francia ────────────────────────────────────────────────────────────
+    "Ligue 1":                  "fra.1",
+    "Coupe de France":          "fra.coupe_de_france",
+    "Trophée des Champions":    "fra.trophee_champions",
+    # ── Alemania ───────────────────────────────────────────────────────────
+    "Bundesliga":               "ger.1",
+    "DFB-Pokal":                "ger.dfb_pokal",
+    "Supercopa de Alemania":    "ger.super_cup",
+    # ── Inglaterra ─────────────────────────────────────────────────────────
+    "Premier League":           "eng.1",
+    "FA Cup":                   "eng.fa",
+    "EFL Cup":                  "eng.league_cup",
+    "Community Shield":         "eng.community_shield",
+    # ── UEFA ───────────────────────────────────────────────────────────────
+    "Champions League":         "uefa.champions",
+    "Europa League":            "uefa.europa",
+    "Conference League":        "uefa.europa.conf",
+    "Supercopa de Europa":      "uefa.super_cup",
+    # ── CONMEBOL ───────────────────────────────────────────────────────────
+    "Copa Libertadores":        "conmebol.libertadores",
+    "Copa Sudamericana":        "conmebol.sudamericana",
+    "Recopa Sudamericana":      "conmebol.recopa",
+    # ── Selecciones ────────────────────────────────────────────────────────
+    "Nations League":           "uefa.nations",
+    "Eurocopa":                 "uefa.euro",
+    "Copa América":             "conmebol.america",
+    # ── Mundial 2026 (clasificatorias + torneo) ────────────────────────────
+    "Clasificación UEFA":       "uefa.worldq",
+    "Clasificación CONMEBOL":   "conmebol.worldq",
+    "Clasificación CONCACAF":   "concacaf.worldq",
+    "Clasificación AFC":        "afc.worldq",
+    "Clasificación CAF":        "caf.worldq",
+    "Mundial de Clubes FIFA":   "fifa.cwc",
+    "Mundial FIFA 2026":        "fifa.world",
 }
 
 ESPN_FINAL  = {"STATUS_FINAL", "STATUS_FULL_TIME"}

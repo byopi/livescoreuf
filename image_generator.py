@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 
 # ─── Assets ────────────────────────────────────────────────────────────────────
 ASSETS_DIR     = Path(__file__).parent / "assets"
+LOGOS_DIR      = ASSETS_DIR / "logos"          # logos pre-descargados por equipo
 FONT_PATH      = os.getenv("FONT_PATH", str(ASSETS_DIR / "font.ttf"))
 WATERMARK_PATH = str(ASSETS_DIR / "logo_uf.png")
 OUTPUT_DIR     = Path("output_images")
@@ -93,32 +94,43 @@ def _download_image(url: str, size: tuple) -> Optional[Image.Image]:
 def _get_logo(team_name: str, espn_url: str = "") -> Optional[Image.Image]:
     """
     Obtiene el logo del equipo. Estrategia en orden:
-      1. Cache en memoria (evita re-descargar en el mismo proceso)
-      2. URL de ESPN (viene directo del scoreboard, alta fiabilidad)
-      3. API de TheSportsDB (pública, sin key)
-
-    El logo se devuelve ya redimensionado a LOGO_SIZE_BIG (210x210).
+      1. Cache en memoria
+      2. Archivo local en assets/logos/<team_name>.png  ← PRINCIPAL
+      3. URL de ESPN CDN (fallback online)
+      4. TheSportsDB (último recurso online)
     """
     TARGET_SIZE = (210, 210)
 
-    # 1. Cache
+    # 1. Cache en memoria
     if team_name in _logo_cache:
-        cached_url = _logo_cache[team_name]
-        if cached_url:
-            img = _download_image(cached_url, TARGET_SIZE)
-            if img:
-                return img
+        cached = _logo_cache[team_name]
+        if cached is not None:
+            return cached
+        # None en cache = ya se intentó y falló todo
+        return None
 
-    # 2. ESPN CDN — siempre intentarlo primero si viene la URL
+    # 2. Archivo local — la fuente más confiable
+    local_path = LOGOS_DIR / f"{team_name}.png"
+    if local_path.exists():
+        try:
+            img = Image.open(str(local_path)).convert("RGBA")
+            img = img.resize(TARGET_SIZE, Image.LANCZOS)
+            logger.info("Logo local OK: %s", team_name)
+            _logo_cache[team_name] = img
+            return img
+        except Exception as exc:
+            logger.warning("Error cargando logo local %s: %s", team_name, exc)
+
+    # 3. ESPN CDN
     if espn_url:
         img = _download_image(espn_url, TARGET_SIZE)
         if img:
             logger.info("Logo ESPN OK: %s", team_name)
-            _logo_cache[team_name] = espn_url
+            _logo_cache[team_name] = img
             return img
-        logger.warning("Logo ESPN falló para %s, probando TheSportsDB...", team_name)
+        logger.warning("Logo ESPN falló: %s", team_name)
 
-    # 3. TheSportsDB
+    # 4. TheSportsDB
     try:
         q = requests.utils.quote(team_name)
         url = f"https://www.thesportsdb.com/api/v1/json/3/searchteams.php?t={q}"
@@ -131,13 +143,13 @@ def _get_logo(team_name: str, espn_url: str = "") -> Optional[Image.Image]:
                     img = _download_image(logo_url, TARGET_SIZE)
                     if img:
                         logger.info("Logo TheSportsDB OK: %s", team_name)
-                        _logo_cache[team_name] = logo_url
+                        _logo_cache[team_name] = img
                         return img
     except Exception as exc:
         logger.debug("TheSportsDB error %s: %s", team_name, exc)
 
     logger.warning("No se encontró logo para: %s", team_name)
-    _logo_cache[team_name] = ""
+    _logo_cache[team_name] = None
     return None
 
 
