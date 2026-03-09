@@ -420,7 +420,7 @@ async def monitor_loop(app: Application):
                                         fix.league_name, "⏳ Obteniendo...", "⏳ Obteniendo...",
                                         side, clock)
                         try:
-                            sent = await app.bot.send_message(dest, text, parse_mode="Markdown")
+                            sent = await app.bot.send_message(dest, text, parse_mode="Markdown", disable_web_page_preview=True)
                             pending_goals.append(PendingGoal(
                                 fixture_id=fid, league_slug=fix.league_slug,
                                 home_name=fix.home_name, away_name=fix.away_name,
@@ -474,7 +474,7 @@ async def monitor_loop(app: Application):
                             with open(img_path, "rb") as f:
                                 await app.bot.send_photo(dest, f, caption=text, parse_mode="Markdown")
                         else:
-                            await app.bot.send_message(dest, text, parse_mode="Markdown")
+                            await app.bot.send_message(dest, text, parse_mode="Markdown", disable_web_page_preview=True)
                     except Exception as exc:
                         logger.error("Error enviando final: %s", exc)
 
@@ -578,7 +578,7 @@ async def lineup_loop(app: Application):
 
                 text = msg_lineup(fix.league_name, fix.home_name, fix.away_name, home_xi, away_xi)
                 dest = CHANNEL_ID if CHANNEL_ID else ADMIN_ID
-                await app.bot.send_message(dest, text, parse_mode="Markdown")
+                await app.bot.send_message(dest, text, parse_mode="Markdown", disable_web_page_preview=True)
                 fix.lineup_sent = True
                 logger.info("Alineaciones enviadas: %s vs %s", fix.home_name, fix.away_name)
             except Exception as exc:
@@ -889,7 +889,7 @@ async def cmd_preview(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # ── 1. Alineaciones ────────────────────────────────────────────────────
     text_lineup = msg_lineup(league, home, away, home_xi, away_xi)
     try:
-        await ctx.bot.send_message(dest, text_lineup, parse_mode="Markdown")
+        await ctx.bot.send_message(dest, text_lineup, parse_mode="Markdown", disable_web_page_preview=True)
         await asyncio.sleep(1)
     except Exception as exc:
         logger.error("cmd_preview error enviando alineaciones: %s", exc)
@@ -907,7 +907,7 @@ async def cmd_preview(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         elapsed="34",
     )
     try:
-        await ctx.bot.send_message(dest, text_goal, parse_mode="Markdown")
+        await ctx.bot.send_message(dest, text_goal, parse_mode="Markdown", disable_web_page_preview=True)
     except Exception as exc:
         logger.error("cmd_preview error enviando gol: %s", exc)
         await update.message.reply_text(f"Error enviando gol: {exc}")

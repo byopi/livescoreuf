@@ -63,62 +63,91 @@ STATS_ORDER = [
 # BÚSQUEDA DE LOGOS EN FOOTBALL-LOGOS.CC
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ─── Cache de logos (evita buscar el mismo equipo dos veces por partido) ───────
+_logo_cache: dict[str, Optional[str]] = {}
+
+
 def _slugify(name: str) -> str:
-    """Convierte 'Real Madrid CF' → 'real-madrid-cf'"""
+    """'Real Madrid CF' → 'real-madrid-cf'"""
     name = name.lower().strip()
+    # Tildes y caracteres especiales
+    for k, v in {"á":"a","é":"e","í":"i","ó":"o","ú":"u","ü":"u","ñ":"n","ß":"ss"}.items():
+        name = name.replace(k, v)
     name = re.sub(r"[^\w\s-]", "", name)
     name = re.sub(r"[\s_]+", "-", name)
-    return name
+    return name.strip("-")
 
 
 def _search_football_logos(team_name: str) -> Optional[str]:
     """
-    Busca el logo en football-logos.cc usando la búsqueda del sitio.
-    Devuelve la URL directa del PNG 256x256 o None si no se encuentra.
+    Busca el logo en football-logos.cc.
+    Estrategia:
+      1. Página de búsqueda del sitio (/search/?q=...) → extrae primera imagen PNG.
+      2. Si falla, intenta URL directa construida con el slug del equipo
+         probando los países más comunes en orden.
+    Devuelve la URL del PNG 256x256 o None.
     """
+    if team_name in _logo_cache:
+        return _logo_cache[team_name]
+
     slug = _slugify(team_name)
-    # Intentar URL directa primero (patrón más común)
-    # El sitio usa: /search/?q=<nombre>
+    found_url: Optional[str] = None
+
+    # ── Intento 1: buscador del sitio ──────────────────────────────────────
     try:
         search_url = f"https://football-logos.cc/search/?q={requests.utils.quote(team_name)}"
         r = requests.get(search_url, headers=HTTP_HEADERS, timeout=10)
-        r.raise_for_status()
-        html = r.text
-
-        # Buscar URLs de imágenes PNG en el HTML
-        pattern = r'https://assets\.football-logos\.cc/logos/[^"\']+256x256/[^"\']+\.png'
-        matches = re.findall(pattern, html)
-
-        if matches:
-            logger.info("Logo encontrado en football-logos.cc para: %s", team_name)
-            return matches[0]
-
-        # Si no encuentra, intentar con slug directamente
-        # Buscar cualquier imagen en los resultados
-        pattern2 = r'https://assets\.football-logos\.cc/logos/[^"\']+\.png'
-        matches2 = re.findall(pattern2, html)
-        if matches2:
-            return matches2[0]
-
+        if r.status_code == 200:
+            html = r.text
+            # El sitio renderiza las imágenes en el HTML estático con este patrón
+            pattern = r'https://assets\.football-logos\.cc/logos/[\w-]+/256x256/[\w.-]+\.png'
+            matches = re.findall(pattern, html)
+            if matches:
+                found_url = matches[0]
+                logger.info("Logo (búsqueda) para '%s': %s", team_name, found_url)
     except Exception as exc:
-        logger.debug("Error buscando en football-logos.cc '%s': %s", team_name, exc)
+        logger.debug("Error búsqueda football-logos.cc '%s': %s", team_name, exc)
 
-    return None
+    # ── Intento 2: URL directa con slug, probando países ──────────────────
+    if not found_url:
+        COUNTRIES = [
+            "spain", "england", "germany", "italy", "france",
+            "portugal", "netherlands", "brazil", "argentina",
+            "turkey", "saudi-arabia", "usa", "mexico", "colombia",
+            "chile", "uruguay", "scotland", "belgium", "tournaments",
+        ]
+        for country in COUNTRIES:
+            # Primero verificar que la página del equipo existe
+            page_url = f"https://football-logos.cc/{country}/{slug}/"
+            try:
+                pr = requests.get(page_url, headers=HTTP_HEADERS, timeout=8)
+                if pr.status_code == 200:
+                    # Extraer la URL de la imagen del PNG 256x256
+                    pattern = r'https://assets\.football-logos\.cc/logos/[\w-]+/256x256/[\w.-]+\.png'
+                    matches = re.findall(pattern, pr.text)
+                    if matches:
+                        found_url = matches[0]
+                        logger.info("Logo (URL directa %s) para '%s': %s",
+                                    country, team_name, found_url)
+                        break
+            except Exception:
+                continue
+
+    _logo_cache[team_name] = found_url
+    return found_url
 
 
 def _get_logo(team_name: str, fallback_url: str = "") -> Optional[Image.Image]:
     """
     Obtiene el logo del equipo:
-    1. Busca en football-logos.cc
-    2. Fallback a URL de ESPN si no encuentra
+      1. football-logos.cc (búsqueda + URL directa por país)
+      2. Fallback a URL de ESPN si no encuentra
     """
-    # Intentar football-logos.cc
     logo_url = _search_football_logos(team_name)
 
-    # Fallback a ESPN CDN
     if not logo_url and fallback_url:
         logo_url = fallback_url
-        logger.debug("Usando logo de ESPN para: %s", team_name)
+        logger.debug("Fallback ESPN logo para: %s", team_name)
 
     if not logo_url:
         return None
