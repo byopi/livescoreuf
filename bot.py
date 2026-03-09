@@ -630,9 +630,107 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/activos  - Ver partidos monitoreados\n"
         "/stop     - Detener monitoreo de un partido\n"
         "/test     - Preview del post final\n"
-        "/preview  - Enviar al canal un ejemplo de alineaciones y gol"
+        "/preview  - Enviar al canal un ejemplo de alineaciones y gol\n"
+        "/debug    - Diagnóstico de ESPN por liga\n"
+        "/espn     - Test directo: /espn <slug> (ej: /espn ita.1)"
     )
     await update.message.reply_text(text)
+
+
+@admin_only
+async def cmd_debug(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    /debug — Muestra qué devuelve ESPN por liga en crudo.
+    Útil para diagnosticar por qué no aparecen partidos.
+    """
+    msg = await update.message.reply_text("Consultando ESPN por liga...")
+    lines = []
+    today_utc   = datetime.now(timezone.utc).date()
+    today_local = datetime.now(TZ).date()
+    hora_srv    = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    lines.append("Hora servidor: " + hora_srv)
+    lines.append("Hoy UTC: " + str(today_utc) + " | Hoy UTC-4: " + str(today_local))
+    lines.append("")
+
+    loop = asyncio.get_running_loop()
+    for league_name, slug in ESPN_LEAGUES.items():
+        try:
+            events = await loop.run_in_executor(_executor, _fetch_scoreboard, slug)
+            if not events:
+                lines.append("❌ " + league_name + ": sin eventos")
+                continue
+
+            today_evs = []
+            for ev in events:
+                raw = ev.get("date", "")
+                if raw:
+                    try:
+                        dt      = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                        d_utc   = dt.astimezone(timezone.utc).date()
+                        d_local = dt.astimezone(TZ).date()
+                        if d_utc == today_utc or d_local == today_local:
+                            today_evs.append(ev)
+                    except Exception:
+                        today_evs.append(ev)
+                else:
+                    today_evs.append(ev)
+
+            if today_evs:
+                for ev in today_evs[:2]:
+                    comps = ev.get("competitions", [{}])[0].get("competitors", [])
+                    home  = next((c for c in comps if c.get("homeAway") == "home"), {})
+                    away  = next((c for c in comps if c.get("homeAway") == "away"), {})
+                    hn    = home.get("team", {}).get("displayName", "?")
+                    an    = away.get("team", {}).get("displayName", "?")
+                    raw_d = ev.get("date", "?")
+                    lines.append("✅ " + league_name + ": " + hn + " vs " + an + " (" + raw_d + ")")
+            else:
+                dates = [e.get("date", "?") for e in events[:2]]
+                lines.append("⚠️ " + league_name + ": " + str(len(events)) + " eventos, ninguno hoy. Fechas: " + str(dates))
+
+        except Exception as exc:
+            lines.append("💥 " + league_name + ": ERROR " + str(exc))
+
+    # Enviar en bloques (límite Telegram 4096 chars)
+    full_text = "\n".join(lines)
+    chunks = [full_text[i:i+3900] for i in range(0, len(full_text), 3900)]
+    await msg.edit_text(chunks[0])
+    for chunk in chunks[1:]:
+        await update.message.reply_text(chunk)
+
+
+@admin_only
+async def cmd_espn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    /espn <slug> — Consulta directa a ESPN para un slug concreto.
+    Ejemplo: /espn ita.1
+    Muestra los primeros 5 eventos RAW sin filtrar fecha.
+    """
+    slug = (ctx.args[0] if ctx.args else "ita.1").strip()
+    msg  = await update.message.reply_text(f"Consultando ESPN: {slug}...")
+    loop = asyncio.get_running_loop()
+    try:
+        events = await loop.run_in_executor(_executor, _fetch_scoreboard, slug)
+    except Exception as exc:
+        await msg.edit_text(f"Error: {exc}")
+        return
+
+    if not events:
+        await msg.edit_text(f"ESPN no devolvió eventos para: {slug}")
+        return
+
+    lines = [f"ESPN slug {slug} — {len(events)} evento(s) totales:\n"]
+    for ev in events[:5]:
+        comps = ev.get("competitions", [{}])[0].get("competitors", [])
+        home  = next((c for c in comps if c.get("homeAway") == "home"), {})
+        away  = next((c for c in comps if c.get("homeAway") == "away"), {})
+        hn    = home.get("team", {}).get("displayName", "?")
+        an    = away.get("team", {}).get("displayName", "?")
+        fecha = ev.get("date", "sin fecha")
+        st    = ev.get("competitions", [{}])[0].get("status", {}).get("type", {}).get("name", "?")
+        lines.append(f"• {hn} vs {an}  |  {fecha}  |  {st}")
+
+    await msg.edit_text("\n".join(lines))
 
 
 @admin_only
@@ -968,6 +1066,9 @@ def main():
     app.add_handler(CommandHandler("stop",     cmd_stop))
     app.add_handler(CommandHandler("test",     cmd_test))
     app.add_handler(CommandHandler("preview",  cmd_preview))
+    app.add_handler(CommandHandler("espn",     cmd_espn))
+    app.add_handler(CommandHandler("debug",    cmd_debug))
+    app.add_handler(CommandHandler("debug",    cmd_debug))
     app.add_handler(CallbackQueryHandler(cb_toggle, pattern=r"^tog:"))
     app.add_handler(CallbackQueryHandler(cb_test,   pattern=r"^tst:"))
 
