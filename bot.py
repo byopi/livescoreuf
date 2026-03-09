@@ -480,7 +480,7 @@ async def monitor_loop(app: Application):
                                         fix.league_name, "⏳ Obteniendo...", "⏳ Obteniendo...",
                                         side, clock)
                         try:
-                            sent = await app.bot.send_message(dest, text, parse_mode="Markdown", disable_web_page_preview=True)
+                            sent = await app.bot.send_message(chat_id=dest, text=text, parse_mode="Markdown", disable_web_page_preview=True)
                             pending_goals.append(PendingGoal(
                                 fixture_id=fid, league_slug=fix.league_slug,
                                 home_name=fix.home_name, away_name=fix.away_name,
@@ -532,9 +532,9 @@ async def monitor_loop(app: Application):
                     try:
                         if img_path and os.path.exists(img_path):
                             with open(img_path, "rb") as f:
-                                await app.bot.send_photo(dest, f, caption=text, parse_mode="Markdown")
+                                await app.bot.send_photo(chat_id=dest, photo=f, caption=text, parse_mode="Markdown")
                         else:
-                            await app.bot.send_message(dest, text, parse_mode="Markdown", disable_web_page_preview=True)
+                            await app.bot.send_message(chat_id=dest, text=text, parse_mode="Markdown", disable_web_page_preview=True)
                     except Exception as exc:
                         logger.error("Error enviando final: %s", exc)
 
@@ -690,7 +690,7 @@ async def _send_lineup_images(
     except Exception as exc:
         logger.error("Error enviando imágenes de lineup: %s", exc)
         # Fallback: enviar solo texto
-        await app.bot.send_message(dest, caption_text, parse_mode="Markdown")
+        await app.bot.send_message(chat_id=dest, text=caption_text, parse_mode="Markdown")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1128,7 +1128,7 @@ async def cmd_preview(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # ── 1. Alineaciones ────────────────────────────────────────────────────
     text_lineup = msg_lineup(league, home, away, home_xi, away_xi)
     try:
-        await ctx.bot.send_message(dest, text_lineup, parse_mode="Markdown", disable_web_page_preview=True)
+        await ctx.bot.send_message(chat_id=dest, text=text_lineup, parse_mode="Markdown", disable_web_page_preview=True)
         await asyncio.sleep(1)
     except Exception as exc:
         logger.error("cmd_preview error enviando alineaciones: %s", exc)
@@ -1146,7 +1146,7 @@ async def cmd_preview(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         elapsed="34",
     )
     try:
-        await ctx.bot.send_message(dest, text_goal, parse_mode="Markdown", disable_web_page_preview=True)
+        await ctx.bot.send_message(chat_id=dest, text=text_goal, parse_mode="Markdown", disable_web_page_preview=True)
     except Exception as exc:
         logger.error("cmd_preview error enviando gol: %s", exc)
         await update.message.reply_text(f"Error enviando gol: {exc}")
