@@ -78,79 +78,143 @@ def _slugify(name: str) -> str:
     return name.strip("-")
 
 
-def _download_image(url: str, size: tuple) -> Optional[Image.Image]:
-    """Descarga una imagen desde una URL y la redimensiona."""
+# ─── Persistencia de IDs conocidos ────────────────────────────────────────────
+_IDS_PATH = ASSETS_DIR / "logo_ids.json"
+
+def _load_ids() -> dict:
+    try:
+        if _IDS_PATH.exists():
+            import json
+            return json.loads(_IDS_PATH.read_text())
+    except Exception:
+        pass
+    return {}
+
+def _save_ids(data: dict):
+    try:
+        import json
+        _IDS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _IDS_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+    except Exception as exc:
+        logger.debug("Error guardando logo_ids.json: %s", exc)
+
+_known_ids: dict = _load_ids()   # {"Team Name": 123, ...}
+
+
+def _img_from_url(url: str) -> Optional[Image.Image]:
     try:
         r = requests.get(url, headers=HTTP_HEADERS, timeout=10)
-        r.raise_for_status()
-        img = Image.open(io.BytesIO(r.content)).convert("RGBA")
-        img = img.resize(size, Image.LANCZOS)
-        return img
+        if r.status_code == 200 and len(r.content) > 500:
+            img = Image.open(io.BytesIO(r.content)).convert("RGBA")
+            return img.resize((210, 210), Image.LANCZOS)
     except Exception as exc:
         logger.debug("Error descargando %s: %s", url, exc)
-        return None
+    return None
+
+
+def _search_apisports(team_name: str) -> Optional[Image.Image]:
+    """
+    Busca el equipo en api-sports.io (sin key, endpoint de búsqueda público),
+    guarda el ID encontrado en logo_ids.json y devuelve el logo.
+    """
+    global _known_ids
+    # Si ya tenemos el ID guardado, ir directo al CDN
+    if team_name in _known_ids:
+        team_id = _known_ids[team_name]
+        if team_id:
+            img = _img_from_url(f"https://media.api-sports.io/football/teams/{team_id}.png")
+            if img:
+                return img
+
+    # Buscar por nombre en la API pública (no requiere key para búsqueda básica)
+    try:
+        r = requests.get(
+            "https://v3.football.api-sports.io/teams",
+            headers={**HTTP_HEADERS, "x-rapidapi-host": "v3.football.api-sports.io"},
+            params={"search": team_name[:20]},
+            timeout=8,
+        )
+        if r.status_code == 200:
+            results = r.json().get("response", [])
+            if results:
+                team_id = results[0]["team"]["id"]
+                _known_ids[team_name] = team_id
+                _save_ids(_known_ids)
+                img = _img_from_url(f"https://media.api-sports.io/football/teams/{team_id}.png")
+                if img:
+                    logger.info("Logo api-sports OK: %s (id=%s)", team_name, team_id)
+                    return img
+    except Exception as exc:
+        logger.debug("api-sports error %s: %s", team_name, exc)
+    return None
+
+
+def _search_thesportsdb(team_name: str) -> Optional[Image.Image]:
+    try:
+        r = requests.get(
+            f"https://www.thesportsdb.com/api/v1/json/3/searchteams.php",
+            headers=HTTP_HEADERS,
+            params={"t": team_name},
+            timeout=8,
+        )
+        if r.status_code == 200:
+            teams = r.json().get("teams") or []
+            if teams:
+                url = teams[0].get("strTeamBadge") or teams[0].get("strTeamLogo")
+                if url:
+                    img = _img_from_url(url)
+                    if img:
+                        logger.info("Logo TheSportsDB OK: %s", team_name)
+                        return img
+    except Exception as exc:
+        logger.debug("TheSportsDB error %s: %s", team_name, exc)
+    return None
 
 
 def _get_logo(team_name: str, espn_url: str = "") -> Optional[Image.Image]:
     """
-    Obtiene el logo del equipo. Estrategia en orden:
-      1. Cache en memoria
-      2. Archivo local en assets/logos/<team_name>.png  ← PRINCIPAL
-      3. URL de ESPN CDN (fallback online)
-      4. TheSportsDB (último recurso online)
+    Obtiene el logo del equipo. Orden de prioridad:
+      1. Cache en memoria (esta sesión)
+      2. Archivo local  assets/logos/<team>.png
+      3. ESPN CDN       (URL directa del scoreboard)
+      4. api-sports.io  CDN público por ID (guarda el ID en logo_ids.json)
+      5. TheSportsDB    (último recurso)
     """
-    TARGET_SIZE = (210, 210)
-
-    # 1. Cache en memoria
+    # 1. Cache RAM
     if team_name in _logo_cache:
-        cached = _logo_cache[team_name]
-        if cached is not None:
-            return cached
-        # None en cache = ya se intentó y falló todo
-        return None
+        return _logo_cache[team_name]   # puede ser None si ya falló todo
 
-    # 2. Archivo local — la fuente más confiable
+    img = None
+
+    # 2. Archivo local pre-descargado
     local_path = LOGOS_DIR / f"{team_name}.png"
     if local_path.exists():
         try:
             img = Image.open(str(local_path)).convert("RGBA")
-            img = img.resize(TARGET_SIZE, Image.LANCZOS)
+            img = img.resize((210, 210), Image.LANCZOS)
             logger.info("Logo local OK: %s", team_name)
-            _logo_cache[team_name] = img
-            return img
-        except Exception as exc:
-            logger.warning("Error cargando logo local %s: %s", team_name, exc)
+        except Exception:
+            img = None
 
-    # 3. ESPN CDN
-    if espn_url:
-        img = _download_image(espn_url, TARGET_SIZE)
+    # 3. ESPN CDN (viene gratis con el scoreboard)
+    if not img and espn_url:
+        img = _img_from_url(espn_url)
         if img:
-            logger.info("Logo ESPN OK: %s", team_name)
-            _logo_cache[team_name] = img
-            return img
-        logger.warning("Logo ESPN falló: %s", team_name)
+            logger.info("Logo ESPN CDN OK: %s", team_name)
 
-    # 4. TheSportsDB
-    try:
-        q = requests.utils.quote(team_name)
-        url = f"https://www.thesportsdb.com/api/v1/json/3/searchteams.php?t={q}"
-        r = requests.get(url, headers=HTTP_HEADERS, timeout=8)
-        if r.status_code == 200:
-            teams = (r.json().get("teams") or [])
-            if teams:
-                logo_url = teams[0].get("strTeamBadge") or teams[0].get("strTeamLogo")
-                if logo_url:
-                    img = _download_image(logo_url, TARGET_SIZE)
-                    if img:
-                        logger.info("Logo TheSportsDB OK: %s", team_name)
-                        _logo_cache[team_name] = img
-                        return img
-    except Exception as exc:
-        logger.debug("TheSportsDB error %s: %s", team_name, exc)
+    # 4. api-sports.io (busca + guarda ID para la próxima)
+    if not img:
+        img = _search_apisports(team_name)
 
-    logger.warning("No se encontró logo para: %s", team_name)
-    _logo_cache[team_name] = None
-    return None
+    # 5. TheSportsDB
+    if not img:
+        img = _search_thesportsdb(team_name)
+
+    if not img:
+        logger.warning("Sin logo para: %s", team_name)
+
+    _logo_cache[team_name] = img   # None si falló, para no reintentar en esta sesión
+    return img
 
 
 # ══════════════════════════════════════════════════════════════════════════════
