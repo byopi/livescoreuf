@@ -14,6 +14,7 @@ from typing import Optional
 
 import requests
 from sofascore_stats import sofascore_raw_stats
+from lineup_image_generator import generate_lineup_images
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from telegram.ext import (
     Application,
@@ -292,22 +293,58 @@ def parse_key_events(summary: dict) -> list[dict]:
     ]
 
 
-def parse_lineups(summary: dict) -> tuple[list[str], list[str]]:
+def parse_lineups(summary: dict) -> tuple[list[str], list[str], str, str, str, str]:
+    """
+    Devuelve (home_xi, away_xi, home_formation, away_formation,
+               home_logo_url, away_logo_url)
+    """
     home_xi: list[str] = []
     away_xi: list[str] = []
-    for i, roster in enumerate(summary.get("rosters", [])[:2]):
+    home_formation = "4-3-3"
+    away_formation = "4-3-3"
+    home_logo_url  = ""
+    away_logo_url  = ""
+
+    rosters = summary.get("rosters", [])[:2]
+    header  = summary.get("header", {})
+    comps   = (header.get("competitions") or [{}])[0].get("competitors", [])
+
+    for i, roster in enumerate(rosters):
         dest = home_xi if i == 0 else away_xi
+
+        # Formación
+        formation = roster.get("formation", "")
+        if formation:
+            if i == 0:
+                home_formation = formation
+            else:
+                away_formation = formation
+
+        # Logo desde header
+        team_data = roster.get("team", {})
+        logo = team_data.get("logo", "")
+        if not logo:
+            # Buscar en competitors del header
+            if i < len(comps):
+                logo = comps[i].get("team", {}).get("logo", "")
+        if i == 0:
+            home_logo_url = logo
+        else:
+            away_logo_url = logo
+
         for entry in roster.get("roster", []):
             if entry.get("starter"):
                 name = (entry.get("athlete", {}).get("shortName")
                         or entry.get("athlete", {}).get("displayName", ""))
                 if name:
                     dest.append(name)
+
         if i == 0:
             home_xi = home_xi[:11]
         else:
             away_xi = away_xi[:11]
-    return home_xi, away_xi
+
+    return home_xi, away_xi, home_formation, away_formation, home_logo_url, away_logo_url
 
 
 def parse_stats(summary: dict) -> tuple[dict, dict]:
@@ -592,20 +629,57 @@ async def lineup_loop(app: Application):
                 summary = await fetch_summary(fix.league_slug, fid)
                 if not summary:
                     continue
-                home_xi, away_xi = parse_lineups(summary)
+                home_xi, away_xi, home_formation, away_formation, home_logo_url, away_logo_url = parse_lineups(summary)
                 if len(home_xi) < 11 or len(away_xi) < 11:
                     fix.lineup_tries += 1
                     logger.info("Alineaciones incompletas %s vs %s (intento %d)",
                                 fix.home_name, fix.away_name, fix.lineup_tries)
                     continue
 
-                text = msg_lineup(fix.league_name, fix.home_name, fix.away_name, home_xi, away_xi)
+                caption = msg_lineup(fix.league_name, fix.home_name, fix.away_name, home_xi, away_xi)
                 dest = CHANNEL_ID if CHANNEL_ID else ADMIN_ID
-                await app.bot.send_message(dest, text, parse_mode="Markdown", disable_web_page_preview=True)
+                await _send_lineup_images(
+                    app, dest, fix.home_name, fix.away_name,
+                    home_xi, away_xi, home_formation, away_formation,
+                    home_logo_url, away_logo_url, fix.league_name,
+                    fid, caption,
+                )
                 fix.lineup_sent = True
                 logger.info("Alineaciones enviadas: %s vs %s", fix.home_name, fix.away_name)
             except Exception as exc:
                 logger.error("lineup_loop error %s: %s", fid, exc)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HELPERS DE ALINEACIONES
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _send_lineup_images(
+    app, dest, home_name, away_name,
+    home_xi, away_xi, home_formation, away_formation,
+    home_logo_url, away_logo_url, league_name,
+    match_id, caption_text,
+):
+    """Genera las 2 imágenes y las envía como media group."""
+    from telegram import InputMediaPhoto
+    loop = asyncio.get_running_loop()
+    try:
+        path_home, path_away = await loop.run_in_executor(
+            _executor, generate_lineup_images,
+            home_name, away_name, home_xi, away_xi,
+            home_formation, away_formation,
+            home_logo_url, away_logo_url,
+            league_name, str(match_id),
+        )
+        media = [
+            InputMediaPhoto(open(path_home, "rb")),
+            InputMediaPhoto(open(path_away, "rb"), caption=caption_text, parse_mode="Markdown"),
+        ]
+        await app.bot.send_media_group(dest, media)
+    except Exception as exc:
+        logger.error("Error enviando imágenes de lineup: %s", exc)
+        # Fallback: enviar solo texto
+        await app.bot.send_message(dest, caption_text, parse_mode="Markdown")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -630,7 +704,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/activos  - Ver partidos monitoreados\n"
         "/stop     - Detener monitoreo de un partido\n"
         "/test     - Preview del post final\n"
-        "/preview  - Enviar al canal un ejemplo de alineaciones y gol\n"
+        "/preview     - Enviar al canal un ejemplo de alineaciones y gol\n"
+        "/testlineup  - Preview privado de imágenes de alineación"
         "/debug    - Diagnóstico de ESPN por liga\n"
         "/espn     - Test directo: /espn <slug> (ej: /espn ita.1)"
     )
@@ -984,6 +1059,38 @@ async def cb_test(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 @admin_only
+async def cmd_testlineup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    /testlineup — Genera y envía al PRIVADO del admin (no al canal)
+    una preview de las imágenes de alineación con datos de ejemplo.
+    Útil para verificar el diseño sin publicar nada.
+    """
+    msg = await update.message.reply_text("Generando imágenes de alineación de prueba...")
+
+    home_xi = ["Ter Stegen", "Kounde", "Araujo", "I. Martinez", "Balde",
+               "Pedri", "Casado", "Gavi", "Yamal", "Lewandowski", "Raphinha"]
+    away_xi = ["Lunin", "Carvajal", "Militao", "Rudiger", "Mendy",
+               "Valverde", "Tchouameni", "Camavinga", "Bellingham",
+               "Vinicius Jr.", "Mbappe"]
+
+    caption = msg_lineup("La Liga", "FC Barcelona", "Real Madrid", home_xi, away_xi)
+
+    try:
+        await _send_lineup_images(
+            update.get_bot(), update.effective_user.id,
+            "FC Barcelona", "Real Madrid",
+            home_xi, away_xi,
+            "4-3-3", "4-3-3",
+            "", "",
+            "La Liga", "testlineup",
+            caption,
+        )
+        await msg.delete()
+    except Exception as exc:
+        await msg.edit_text(f"Error generando preview: {exc}")
+
+
+@admin_only
 async def cmd_preview(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
     /preview — Envía al canal un mensaje de alineaciones y uno de gol de prueba,
@@ -1065,7 +1172,8 @@ def main():
     app.add_handler(CommandHandler("activos",  cmd_activos))
     app.add_handler(CommandHandler("stop",     cmd_stop))
     app.add_handler(CommandHandler("test",     cmd_test))
-    app.add_handler(CommandHandler("preview",  cmd_preview))
+    app.add_handler(CommandHandler("preview",     cmd_preview))
+    app.add_handler(CommandHandler("testlineup",  cmd_testlineup))
     app.add_handler(CommandHandler("espn",     cmd_espn))
     app.add_handler(CommandHandler("debug",    cmd_debug))
     app.add_handler(CommandHandler("debug",    cmd_debug))
