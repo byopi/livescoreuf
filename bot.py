@@ -41,7 +41,7 @@ CHANNEL_ID       = os.getenv("CHANNEL_ID", "")
 POLL_INTERVAL    = int(os.getenv("POLL_INTERVAL",    "60"))
 RESOLVE_INTERVAL = int(os.getenv("RESOLVE_INTERVAL", "15"))
 RESOLVE_TIMEOUT  = int(os.getenv("RESOLVE_TIMEOUT",  "180"))
-LINEUP_INTERVAL  = int(os.getenv("LINEUP_INTERVAL",  "300"))
+LINEUP_INTERVAL  = int(os.getenv("LINEUP_INTERVAL",  "120"))
 
 # ─── ESPN ──────────────────────────────────────────────────────────────────────
 ESPN_SCOREBOARD = "https://site.api.espn.com/apis/site/v2/sports/soccer/{league}/scoreboard"
@@ -620,20 +620,49 @@ async def lineup_loop(app: Application):
         now = datetime.now(timezone.utc)
 
         for fid, fix in list(tracked.items()):
-            if fix.lineup_sent or fix.finished or fix.kickoff_utc is None:
+            if fix.lineup_sent or fix.finished:
                 continue
-            mins = (fix.kickoff_utc - now).total_seconds() / 60
-            if not (-15 <= mins <= 60):
-                continue
+            # Si kickoff_utc es None, intentar igualmente si el partido ya está activo
+            if fix.kickoff_utc is not None:
+                mins = (fix.kickoff_utc - now).total_seconds() / 60
+                # Buscar desde 90 min antes hasta 30 min después del inicio
+                if not (-30 <= mins <= 90):
+                    logger.debug(
+                        "Lineup %s vs %s: fuera de ventana (%.1f min para inicio)",
+                        fix.home_name, fix.away_name, mins,
+                    )
+                    continue
+                logger.info(
+                    "Lineup %s vs %s: dentro de ventana (%.1f min para inicio, intento %d)",
+                    fix.home_name, fix.away_name, mins, fix.lineup_tries + 1,
+                )
+            else:
+                # Sin hora de inicio conocida: solo intentar si el partido está en vivo
+                if fix.status not in ESPN_LIVE:
+                    continue
+                logger.info(
+                    "Lineup %s vs %s: sin kickoff_utc, partido en vivo, intentando...",
+                    fix.home_name, fix.away_name,
+                )
             try:
                 summary = await fetch_summary(fix.league_slug, fid)
                 if not summary:
+                    logger.warning("Lineup %s vs %s: summary vacío", fix.home_name, fix.away_name)
                     continue
                 home_xi, away_xi, home_formation, away_formation, home_logo_url, away_logo_url = parse_lineups(summary)
                 if len(home_xi) < 11 or len(away_xi) < 11:
                     fix.lineup_tries += 1
-                    logger.info("Alineaciones incompletas %s vs %s (intento %d)",
-                                fix.home_name, fix.away_name, fix.lineup_tries)
+                    logger.info(
+                        "Alineaciones incompletas %s vs %s: home=%d away=%d (intento %d)",
+                        fix.home_name, fix.away_name, len(home_xi), len(away_xi), fix.lineup_tries,
+                    )
+                    # Tras 20 intentos fallidos, rendirse para no spamear la API
+                    if fix.lineup_tries >= 20:
+                        logger.warning(
+                            "Lineup %s vs %s: demasiados intentos, marcando como enviado",
+                            fix.home_name, fix.away_name,
+                        )
+                        fix.lineup_sent = True
                     continue
 
                 caption = msg_lineup(fix.league_name, fix.home_name, fix.away_name, home_xi, away_xi)
@@ -716,9 +745,11 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/stop     - Detener monitoreo de un partido\n"
         "/test     - Preview del post final\n"
         "/preview     - Enviar al canal un ejemplo de alineaciones y gol\n"
+        "/lineup      - Enviar alineaciones manualmente al canal\n"
         "/testlineup  - Preview privado de imágenes de alineación"
         "/debug    - Diagnóstico de ESPN por liga\n"
-        "/espn     - Test directo: /espn <slug> (ej: /espn ita.1)"
+        "/espn     - Test directo: /espn <slug> (ej: /espn ita.1)\n"
+        "/lineup   - Forzar envío de alineaciones de un partido activo"
     )
     await update.message.reply_text(text)
 
@@ -1070,6 +1101,190 @@ async def cb_test(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 @admin_only
+async def cmd_lineup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    /lineup <event_id> — Fuerza el envío inmediato de las alineaciones
+    de un partido activo al canal. Útil si el loop automático no las envió.
+    Sin argumentos muestra los partidos activos para seleccionar.
+    """
+    if ctx.args:
+        fid = ctx.args[0]
+        fix = tracked.get(fid)
+        if not fix:
+            await update.message.reply_text(f"Partido {fid} no está en monitoreo.")
+            return
+        msg = await update.message.reply_text(f"Obteniendo alineaciones de {fix.home_name} vs {fix.away_name}...")
+        summary = await fetch_summary(fix.league_slug, fid)
+        if not summary:
+            await msg.edit_text("No se pudo obtener el summary de ESPN.")
+            return
+        home_xi, away_xi, home_formation, away_formation, home_logo_url, away_logo_url = parse_lineups(summary)
+        if len(home_xi) < 11 or len(away_xi) < 11:
+            await msg.edit_text(
+                f"Alineaciones incompletas: {fix.home_name} ({len(home_xi)}) vs {fix.away_name} ({len(away_xi)})\n"
+                f"ESPN aún no publicó los XI titulares."
+            )
+            return
+        caption = msg_lineup(fix.league_name, fix.home_name, fix.away_name, home_xi, away_xi)
+        dest = CHANNEL_ID if CHANNEL_ID else ADMIN_ID
+        await _send_lineup_images(
+            ctx.application, dest,
+            fix.home_name, fix.away_name,
+            home_xi, away_xi,
+            home_formation, away_formation,
+            home_logo_url, away_logo_url,
+            fix.league_name, fid, caption,
+        )
+        fix.lineup_sent = True
+        await msg.edit_text(f"✅ Alineaciones enviadas: {fix.home_name} vs {fix.away_name}")
+        return
+
+    # Sin args: mostrar botones con partidos activos
+    if not tracked:
+        await update.message.reply_text("No hay partidos en monitoreo.")
+        return
+    keyboard = []
+    for fid, fix in tracked.items():
+        sent = "✓" if fix.lineup_sent else "⏳"
+        label = f"{sent} {fix.home_name} vs {fix.away_name} ({fix.league_name})"
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"lup:{fid}")])
+    await update.message.reply_text(
+        "Selecciona partido para forzar alineaciones:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def cb_lineup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.from_user.id != ADMIN_ID:
+        return
+    fid = query.data.split(":")[1]
+    ctx.args = [fid]
+    # Reusar cmd_lineup pasando el fid directamente
+    fix = tracked.get(fid)
+    if not fix:
+        await query.edit_message_text(f"Partido {fid} ya no está activo.")
+        return
+    await query.edit_message_text(f"Obteniendo alineaciones de {fix.home_name} vs {fix.away_name}...")
+    summary = await fetch_summary(fix.league_slug, fid)
+    if not summary:
+        await query.edit_message_text("No se pudo obtener el summary de ESPN.")
+        return
+    home_xi, away_xi, home_formation, away_formation, home_logo_url, away_logo_url = parse_lineups(summary)
+    if len(home_xi) < 11 or len(away_xi) < 11:
+        await query.edit_message_text(
+            f"Alineaciones incompletas ({len(home_xi)} + {len(away_xi)} jugadores).\n"
+            f"ESPN aún no publicó los XI."
+        )
+        return
+    caption = msg_lineup(fix.league_name, fix.home_name, fix.away_name, home_xi, away_xi)
+    dest = CHANNEL_ID if CHANNEL_ID else ADMIN_ID
+    await _send_lineup_images(
+        ctx.application, dest,
+        fix.home_name, fix.away_name,
+        home_xi, away_xi,
+        home_formation, away_formation,
+        home_logo_url, away_logo_url,
+        fix.league_name, fid, caption,
+    )
+    fix.lineup_sent = True
+    await query.edit_message_text(f"✅ Alineaciones enviadas: {fix.home_name} vs {fix.away_name}")
+
+
+@admin_only
+async def cmd_lineup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    /lineup [event_id] — Fuerza el envío de alineaciones al canal.
+
+    Sin argumentos: muestra los partidos monitoreados para elegir.
+    Con event_id:   busca las alineaciones y las envía inmediatamente
+                    ignorando si ya se enviaron antes (útil si falló).
+    """
+    args = ctx.args
+
+    # Sin argumento → mostrar botones con partidos activos
+    if not args:
+        if not tracked:
+            await update.message.reply_text("No hay partidos monitoreados. Usa /partidos para activar uno.")
+            return
+        keyboard = []
+        for fid, fix in tracked.items():
+            hora = fix.kickoff_utc.astimezone(TZ).strftime("%H:%M") if fix.kickoff_utc else "--:--"
+            sent = "✓ " if fix.lineup_sent else ""
+            label = f"{sent}{hora} | {fix.home_name} vs {fix.away_name} ({fix.league_name})"
+            keyboard.append([InlineKeyboardButton(label, callback_data=f"lin:{fid}")])
+        await update.message.reply_text(
+            "Selecciona el partido para enviar alineaciones:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return
+
+    # Con event_id → forzar envío directamente
+    fid = args[0].strip()
+    await _force_lineup(fid, update.message, ctx.application)
+
+
+async def _force_lineup(fid: str, reply_to, app):
+    """Lógica compartida entre /lineup y el callback inline."""
+    # Buscar en tracked o intentar con slug conocido
+    fix = tracked.get(fid)
+    if fix:
+        slug        = fix.league_slug
+        home_name   = fix.home_name
+        away_name   = fix.away_name
+        league_name = fix.league_name
+        logo_home   = ""
+        logo_away   = ""
+    else:
+        await reply_to.reply_text(f"Partido {fid} no está en seguimiento. Actívalo primero con /partidos.")
+        return
+
+    msg = await reply_to.reply_text(f"Obteniendo alineaciones de {home_name} vs {away_name}...")
+
+    summary = await fetch_summary(slug, fid)
+    if not summary:
+        await msg.edit_text("ESPN no devolvió datos para este partido.")
+        return
+
+    home_xi, away_xi, home_formation, away_formation, logo_home, logo_away = parse_lineups(summary)
+
+    if len(home_xi) < 11 or len(away_xi) < 11:
+        await msg.edit_text(
+            f"Alineaciones incompletas (local: {len(home_xi)}/11, visita: {len(away_xi)}/11). "
+            "Es posible que ESPN aún no las haya publicado."
+        )
+        return
+
+    await msg.edit_text("Generando imágenes...")
+    caption = msg_lineup(league_name, home_name, away_name, home_xi, away_xi)
+    dest    = CHANNEL_ID if CHANNEL_ID else ADMIN_ID
+
+    await _send_lineup_images(
+        app, dest, home_name, away_name,
+        home_xi, away_xi, home_formation, away_formation,
+        logo_home, logo_away, league_name, fid, caption,
+    )
+
+    # Marcar como enviado para que el loop no lo duplique
+    if fid in tracked:
+        tracked[fid].lineup_sent = True
+
+    destino = "el canal" if CHANNEL_ID else "tu DM"
+    await msg.edit_text(f"✅ Alineaciones enviadas a {destino}.")
+
+
+async def cb_lineup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Callback del botón inline de /lineup."""
+    query = update.callback_query
+    await query.answer()
+    if query.from_user.id != ADMIN_ID:
+        return
+    fid = query.data.split(":")[1]
+    await _force_lineup(fid, query.message, ctx.application)
+
+
+@admin_only
 async def cmd_testlineup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
     /testlineup — Genera y envía al PRIVADO del admin (no al canal)
@@ -1184,7 +1399,11 @@ def main():
     app.add_handler(CommandHandler("stop",     cmd_stop))
     app.add_handler(CommandHandler("test",     cmd_test))
     app.add_handler(CommandHandler("preview",     cmd_preview))
+    app.add_handler(CommandHandler("lineup",      cmd_lineup))
     app.add_handler(CommandHandler("testlineup",  cmd_testlineup))
+    app.add_handler(CallbackQueryHandler(cb_lineup, pattern=r"^lin:"))
+    app.add_handler(CommandHandler("lineup",      cmd_lineup))
+    app.add_handler(CallbackQueryHandler(cb_lineup, pattern=r"^lup:"))
     app.add_handler(CommandHandler("espn",     cmd_espn))
     app.add_handler(CommandHandler("debug",    cmd_debug))
     app.add_handler(CommandHandler("debug",    cmd_debug))
