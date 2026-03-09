@@ -77,103 +77,68 @@ def _slugify(name: str) -> str:
     return name.strip("-")
 
 
-# Aliases para nombres que TheSportsDB conoce diferente
-_NAME_ALIASES = {
-    "internazionale":    "Inter Milan",
-    "inter":             "Inter Milan",
-    "fc internazionale": "Inter Milan",
-    "paris fc":          "Paris FC",
-    "ac milan":          "AC Milan",
-    "atletico madrid":   "Atletico Madrid",
-    "atletico de madrid":"Atletico Madrid",
-    "paris saint-germain":"Paris Saint-Germain",
-    "psg":               "Paris Saint-Germain",
-    "manchester united": "Manchester United",
-    "man united":        "Manchester United",
-    "manchester city":   "Manchester City",
-    "man city":          "Manchester City",
-    "tottenham hotspur": "Tottenham Hotspur",
-    "spurs":             "Tottenham Hotspur",
-    "olympique lyonnais":"Olympique Lyonnais",
-    "lyon":              "Olympique Lyonnais",
-    "olympique de marseille": "Olympique Marseille",
-    "bayer leverkusen":  "Bayer Leverkusen",
-    "rb leipzig":        "RB Leipzig",
-    "borussia dortmund": "Borussia Dortmund",
-    "bvb":               "Borussia Dortmund",
-}
-
-
-def _fetch_logo_thesportsdb(team_name: str) -> Optional[str]:
-    """
-    Busca el logo en TheSportsDB (API pública, sin key).
-    Intenta el nombre original y aliases conocidos.
-    """
-    names_to_try = [team_name]
-    alias = _NAME_ALIASES.get(team_name.lower().strip())
-    if alias and alias != team_name:
-        names_to_try.append(alias)
-
-    for name in names_to_try:
-        try:
-            url = f"https://www.thesportsdb.com/api/v1/json/3/searchteams.php?t={requests.utils.quote(name)}"
-            r = requests.get(url, headers=HTTP_HEADERS, timeout=8)
-            if r.status_code == 200:
-                data = r.json()
-                teams = data.get("teams") or []
-                if teams:
-                    logo = teams[0].get("strTeamBadge") or teams[0].get("strTeamLogo")
-                    if logo:
-                        logger.info("Logo TheSportsDB para '%s': %s", name, logo)
-                        return logo
-        except Exception as exc:
-            logger.debug("TheSportsDB error '%s': %s", name, exc)
-
-    return None
-
-
-def _get_logo(team_name: str, fallback_url: str = "") -> Optional[Image.Image]:
-    """
-    Obtiene el logo del equipo en este orden:
-      1. URL de ESPN CDN (ya viene del scoreboard, es la más fiable)
-      2. TheSportsDB (API pública, sin key)
-    """
-    if team_name in _logo_cache:
-        logo_url = _logo_cache[team_name]
-    else:
-        # Primero ESPN (fallback_url), luego TheSportsDB
-        logo_url = fallback_url or None
-        if not logo_url:
-            logo_url = _fetch_logo_thesportsdb(team_name)
-        _logo_cache[team_name] = logo_url
-
-    if not logo_url:
-        logger.warning("No se encontró logo para: %s", team_name)
-        return None
-
+def _download_image(url: str, size: tuple) -> Optional[Image.Image]:
+    """Descarga una imagen desde una URL y la redimensiona."""
     try:
-        r = requests.get(logo_url, headers=HTTP_HEADERS, timeout=10)
+        r = requests.get(url, headers=HTTP_HEADERS, timeout=10)
         r.raise_for_status()
         img = Image.open(io.BytesIO(r.content)).convert("RGBA")
-        img = img.resize(LOGO_SIZE, Image.LANCZOS)
+        img = img.resize(size, Image.LANCZOS)
         return img
     except Exception as exc:
-        # Si ESPN falla, intentar TheSportsDB como último recurso
-        if logo_url == fallback_url and fallback_url:
-            logger.warning("ESPN logo falló, intentando TheSportsDB para: %s", team_name)
-            alt_url = _fetch_logo_thesportsdb(team_name)
-            if alt_url:
-                try:
-                    r2 = requests.get(alt_url, headers=HTTP_HEADERS, timeout=10)
-                    r2.raise_for_status()
-                    img = Image.open(io.BytesIO(r2.content)).convert("RGBA")
-                    img = img.resize(LOGO_SIZE, Image.LANCZOS)
-                    _logo_cache[team_name] = alt_url
-                    return img
-                except Exception:
-                    pass
-        logger.warning("Error descargando logo %s: %s", logo_url, exc)
+        logger.debug("Error descargando %s: %s", url, exc)
         return None
+
+
+def _get_logo(team_name: str, espn_url: str = "") -> Optional[Image.Image]:
+    """
+    Obtiene el logo del equipo. Estrategia en orden:
+      1. Cache en memoria (evita re-descargar en el mismo proceso)
+      2. URL de ESPN (viene directo del scoreboard, alta fiabilidad)
+      3. API de TheSportsDB (pública, sin key)
+
+    El logo se devuelve ya redimensionado a LOGO_SIZE_BIG (210x210).
+    """
+    TARGET_SIZE = (210, 210)
+
+    # 1. Cache
+    if team_name in _logo_cache:
+        cached_url = _logo_cache[team_name]
+        if cached_url:
+            img = _download_image(cached_url, TARGET_SIZE)
+            if img:
+                return img
+
+    # 2. ESPN CDN — siempre intentarlo primero si viene la URL
+    if espn_url:
+        img = _download_image(espn_url, TARGET_SIZE)
+        if img:
+            logger.info("Logo ESPN OK: %s", team_name)
+            _logo_cache[team_name] = espn_url
+            return img
+        logger.warning("Logo ESPN falló para %s, probando TheSportsDB...", team_name)
+
+    # 3. TheSportsDB
+    try:
+        q = requests.utils.quote(team_name)
+        url = f"https://www.thesportsdb.com/api/v1/json/3/searchteams.php?t={q}"
+        r = requests.get(url, headers=HTTP_HEADERS, timeout=8)
+        if r.status_code == 200:
+            teams = (r.json().get("teams") or [])
+            if teams:
+                logo_url = teams[0].get("strTeamBadge") or teams[0].get("strTeamLogo")
+                if logo_url:
+                    img = _download_image(logo_url, TARGET_SIZE)
+                    if img:
+                        logger.info("Logo TheSportsDB OK: %s", team_name)
+                        _logo_cache[team_name] = logo_url
+                        return img
+    except Exception as exc:
+        logger.debug("TheSportsDB error %s: %s", team_name, exc)
+
+    logger.warning("No se encontró logo para: %s", team_name)
+    _logo_cache[team_name] = ""
+    return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -160,20 +160,33 @@ def _fetch_summary(slug: str, event_id: str) -> Optional[dict]:
 
 
 def _fetch_all_today() -> list[dict]:
-    """Consulta todas las ligas y devuelve partidos del dia en UTC-4."""
-    today = datetime.now(TZ).date()
+    """
+    Consulta todas las ligas y devuelve partidos del dia.
+    Acepta partidos de hoy en UTC-4 O en UTC para no perder
+    partidos nocturnos/madrugada según dónde corra el servidor.
+    """
+    today_local = datetime.now(TZ).date()
+    today_utc   = datetime.now(timezone.utc).date()
+    valid_dates = {today_local, today_utc}
+
     results = []
+    seen = set()
     for league_name, slug in ESPN_LEAGUES.items():
         for ev in _fetch_scoreboard(slug):
+            if ev["id"] in seen:
+                continue
             raw = ev.get("date", "")
             include = True
             if raw:
                 try:
                     dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-                    include = dt.astimezone(TZ).date() == today
+                    # Incluir si el partido cae en hoy (UTC-4) o hoy (UTC)
+                    include = (dt.astimezone(TZ).date() in valid_dates or
+                               dt.astimezone(timezone.utc).date() in valid_dates)
                 except Exception:
                     pass
             if include:
+                seen.add(ev["id"])
                 ev["_slug"]   = slug
                 ev["_league"] = league_name
                 results.append(ev)
