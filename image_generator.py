@@ -77,24 +77,58 @@ def _slugify(name: str) -> str:
     return name.strip("-")
 
 
+# Aliases para nombres que TheSportsDB conoce diferente
+_NAME_ALIASES = {
+    "internazionale":    "Inter Milan",
+    "inter":             "Inter Milan",
+    "fc internazionale": "Inter Milan",
+    "paris fc":          "Paris FC",
+    "ac milan":          "AC Milan",
+    "atletico madrid":   "Atletico Madrid",
+    "atletico de madrid":"Atletico Madrid",
+    "paris saint-germain":"Paris Saint-Germain",
+    "psg":               "Paris Saint-Germain",
+    "manchester united": "Manchester United",
+    "man united":        "Manchester United",
+    "manchester city":   "Manchester City",
+    "man city":          "Manchester City",
+    "tottenham hotspur": "Tottenham Hotspur",
+    "spurs":             "Tottenham Hotspur",
+    "olympique lyonnais":"Olympique Lyonnais",
+    "lyon":              "Olympique Lyonnais",
+    "olympique de marseille": "Olympique Marseille",
+    "bayer leverkusen":  "Bayer Leverkusen",
+    "rb leipzig":        "RB Leipzig",
+    "borussia dortmund": "Borussia Dortmund",
+    "bvb":               "Borussia Dortmund",
+}
+
+
 def _fetch_logo_thesportsdb(team_name: str) -> Optional[str]:
     """
     Busca el logo en TheSportsDB (API pública, sin key).
-    Devuelve la URL del PNG o None.
+    Intenta el nombre original y aliases conocidos.
     """
-    try:
-        url = f"https://www.thesportsdb.com/api/v1/json/3/searchteams.php?t={requests.utils.quote(team_name)}"
-        r = requests.get(url, headers=HTTP_HEADERS, timeout=8)
-        if r.status_code == 200:
-            data = r.json()
-            teams = data.get("teams") or []
-            if teams:
-                logo = teams[0].get("strTeamBadge") or teams[0].get("strTeamLogo")
-                if logo:
-                    logger.info("Logo TheSportsDB para '%s': %s", team_name, logo)
-                    return logo
-    except Exception as exc:
-        logger.debug("TheSportsDB error '%s': %s", team_name, exc)
+    names_to_try = [team_name]
+    alias = _NAME_ALIASES.get(team_name.lower().strip())
+    if alias and alias != team_name:
+        names_to_try.append(alias)
+
+    for name in names_to_try:
+        try:
+            url = f"https://www.thesportsdb.com/api/v1/json/3/searchteams.php?t={requests.utils.quote(name)}"
+            r = requests.get(url, headers=HTTP_HEADERS, timeout=8)
+            if r.status_code == 200:
+                data = r.json()
+                teams = data.get("teams") or []
+                if teams:
+                    logo = teams[0].get("strTeamBadge") or teams[0].get("strTeamLogo")
+                    if logo:
+                        logger.info("Logo TheSportsDB para '%s': %s", name, logo)
+                        return logo
+        except Exception as exc:
+            logger.debug("TheSportsDB error '%s': %s", name, exc)
+
     return None
 
 
@@ -272,7 +306,7 @@ def _draw_bar(draw: ImageDraw.Draw, x: int, y: int, bar_w: int,
 # GENERADOR PRINCIPAL
 # ══════════════════════════════════════════════════════════════════════════════
 
-def generate_match_summary(fixture_data: dict, raw_stats: list[dict]) -> str:
+def generate_match_summary(fixture_data: dict, raw_stats: list[dict] = None) -> str:
     home_name  = fixture_data["teams"]["home"]["name"]
     away_name  = fixture_data["teams"]["away"]["name"]
     home_score = fixture_data["goals"]["home"] or 0
@@ -281,109 +315,122 @@ def generate_match_summary(fixture_data: dict, raw_stats: list[dict]) -> str:
     home_logo_fallback = fixture_data["teams"]["home"].get("logo", "")
     away_logo_fallback = fixture_data["teams"]["away"].get("logo", "")
 
-    home_s, away_s = _parse_stats(raw_stats)
-
     # ── Logos ──────────────────────────────────────────────────────────────
     home_logo = _get_logo(home_name, home_logo_fallback)
     away_logo = _get_logo(away_name, away_logo_fallback)
 
-    # ── Canvas ─────────────────────────────────────────────────────────────
-    canvas = Image.new("RGBA", (W, H), C_BG)
+    # ── Canvas (formato cuadrado, limpio) ───────────────────────────────────
+    CW, CH = 1080, 1080
+    canvas = Image.new("RGBA", (CW, CH), C_BG)
     draw   = ImageDraw.Draw(canvas)
 
     # ── Fuentes ────────────────────────────────────────────────────────────
-    f_league = _font(21)
-    f_score  = _font(92)
-    f_team   = _font(24)
-    f_final  = _font(17)
-    f_label  = _font(16)
-    f_val    = _font(14)
-    f_brand  = _font(14)
+    f_league = _font(26)
+    f_score  = _font(120)
+    f_final  = _font(20)
+    f_brand  = _font(15)
+    f_vs     = _font(38)
 
-    # ── Tarjeta ────────────────────────────────────────────────────────────
-    _rr(draw, (CARD_M, CARD_M, W-CARD_M, H-CARD_M), CARD_R, C_CARD)
+    # ── Tarjeta interior ───────────────────────────────────────────────────
+    _rr(draw, (CARD_M, CARD_M, CW-CARD_M, CH-CARD_M), CARD_R, C_CARD)
 
-    # ── Cabecera ───────────────────────────────────────────────────────────
-    HDR_H = 52
-    _rr(draw, (CARD_M, CARD_M, W-CARD_M, CARD_M+HDR_H), CARD_R, C_HEADER)
-    _centered_text(draw, league.upper(), f_league, CARD_M + (HDR_H-21)//2, C_ACCENT)
+    # ── Cabecera con nombre de liga ─────────────────────────────────────────
+    HDR_H = 60
+    _rr(draw, (CARD_M, CARD_M, CW-CARD_M, CARD_M+HDR_H), CARD_R, C_HEADER)
+    lw = draw.textlength(league.upper(), font=f_league)
+    draw.text(((CW - lw) / 2, CARD_M + (HDR_H - 26) // 2), league.upper(),
+              font=f_league, fill=C_ACCENT)
 
-    # ── Logos y nombres ────────────────────────────────────────────────────
-    LOGO_Y   = CARD_M + HDR_H + 18
-    HOME_X   = CARD_M + 45
-    AWAY_X   = W - CARD_M - 45 - LOGO_SIZE[0]
-    HOME_CX  = HOME_X + LOGO_SIZE[0] // 2
-    AWAY_CX  = AWAY_X + LOGO_SIZE[0] // 2
+    # ── Área central: logos + marcador ─────────────────────────────────────
+    # Dividimos el espacio entre cabecera y watermark en tres columnas:
+    # [logo local] [marcador] [logo visitante]
 
-    _paste_logo(canvas, home_logo, draw, HOME_X, LOGO_Y, home_name)
-    _paste_logo(canvas, away_logo, draw, AWAY_X, LOGO_Y, away_name)
+    LOGO_SIZE_BIG = (210, 210)
+    CONTENT_TOP = CARD_M + HDR_H + 40
+    CONTENT_BOT = CH - CARD_M - 80   # reserva para watermark
+    CENTER_Y    = (CONTENT_TOP + CONTENT_BOT) // 2
 
-    NAME_Y = LOGO_Y + LOGO_SIZE[1] + 8
-    fh = _font(22 if len(home_name) <= 14 else 17)
-    fa = _font(22 if len(away_name) <= 14 else 17)
+    # Posiciones X de cada columna
+    HOME_CX = CARD_M + 40 + LOGO_SIZE_BIG[0] // 2        # centro logo local
+    AWAY_CX = CW - CARD_M - 40 - LOGO_SIZE_BIG[0] // 2   # centro logo visit.
+    HOME_LX = HOME_CX - LOGO_SIZE_BIG[0] // 2
+    AWAY_LX = AWAY_CX - LOGO_SIZE_BIG[0] // 2
+    LOGO_Y  = CENTER_Y - LOGO_SIZE_BIG[1] // 2 - 30       # un poco arriba del centro
 
+    # Logos
+    def _paste_big(logo, cx, name):
+        lx = cx - LOGO_SIZE_BIG[0] // 2
+        ly = LOGO_Y
+        if logo:
+            logo_big = logo.resize(LOGO_SIZE_BIG, Image.LANCZOS)
+            # Sombra suave
+            sh = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+            sd = ImageDraw.Draw(sh)
+            r  = LOGO_SIZE_BIG[0] // 2 + 6
+            sd.ellipse([cx-r+6, ly+LOGO_SIZE_BIG[1]//2-r+6,
+                        cx+r+6, ly+LOGO_SIZE_BIG[1]//2+r+6], fill=(0,0,0,80))
+            sh = sh.filter(ImageFilter.GaussianBlur(10))
+            canvas.alpha_composite(sh)
+            canvas.paste(logo_big, (lx, ly), logo_big)
+        else:
+            r  = LOGO_SIZE_BIG[0] // 2
+            draw.ellipse([lx, ly, lx+LOGO_SIZE_BIG[0], ly+LOGO_SIZE_BIG[1]],
+                         fill=C_DIVIDER)
+            fi = _font(28)
+            init = "".join(w[0].upper() for w in name.split()[:2])
+            iw = draw.textlength(init, font=fi)
+            draw.text((cx - iw/2, ly + LOGO_SIZE_BIG[1]//2 - 18), init,
+                      font=fi, fill=C_WHITE)
+
+    _paste_big(home_logo, HOME_CX, home_name)
+    _paste_big(away_logo, AWAY_CX, away_name)
+
+    # Nombres de equipos bajo los logos
+    NAME_Y = LOGO_Y + LOGO_SIZE_BIG[1] + 14
+    fh = _font(26 if len(home_name) <= 14 else 20)
+    fa = _font(26 if len(away_name) <= 14 else 20)
     hw = draw.textlength(home_name, font=fh)
     draw.text((HOME_CX - hw/2, NAME_Y), home_name, font=fh, fill=C_WHITE)
     aw = draw.textlength(away_name, font=fa)
     draw.text((AWAY_CX - aw/2, NAME_Y), away_name, font=fa, fill=C_WHITE)
 
-    # ── Marcador ───────────────────────────────────────────────────────────
-    score_str = f"{home_score}   {away_score}"
+    # ── Marcador central ───────────────────────────────────────────────────
+    score_str = f"{home_score} - {away_score}"
     sw = draw.textlength(score_str, font=f_score)
-    SX = (W - sw) / 2
-    SY = LOGO_Y + 8
+    SX = (CW - sw) / 2
+    SY = LOGO_Y + LOGO_SIZE_BIG[1] // 2 - 70   # centrado verticalmente con logos
 
-    _rr(draw, (SX-16, SY-6, SX+sw+16, SY+86), 10, C_SCORE_BG)
-
-    # Guion separador
-    gw = draw.textlength("-", font=_font(34))
-    draw.text(((W-gw)/2, SY+28), "-", font=_font(34), fill=C_GRAY)
+    # Caja del marcador
+    PAD_X, PAD_Y = 24, 10
+    _rr(draw,
+        (SX - PAD_X, SY - PAD_Y, SX + sw + PAD_X, SY + 120 + PAD_Y),
+        14, C_SCORE_BG)
 
     draw.text((SX, SY), score_str, font=f_score, fill=C_WHITE)
 
-    # FINAL label
-    _centered_text(draw, "FINAL", f_final, SY + 90, C_ACCENT)
-
-    # ── Divisor ────────────────────────────────────────────────────────────
-    DIV_Y = NAME_Y + 40
-    draw.line([(CARD_M+18, DIV_Y), (W-CARD_M-18, DIV_Y)], fill=C_DIVIDER, width=1)
-
-    # ── Estadísticas ───────────────────────────────────────────────────────
-    BAR_X   = CARD_M + 55
-    BAR_W   = W - (CARD_M + 55) * 2
-    STATS_Y = DIV_Y + 16
-    ROW_H   = 52
-
-    drawn = 0
-    for key, is_pct, label_es in STATS_ORDER:
-        vh = home_s.get(key, 0.0)
-        va = away_s.get(key, 0.0)
-        if vh == 0.0 and va == 0.0:
-            continue
-        _draw_bar(draw, BAR_X, STATS_Y + drawn * ROW_H, BAR_W,
-                  vh, va, label_es, is_pct, f_label, f_val)
-        drawn += 1
+    # Etiqueta FINAL
+    _centered_text(draw, "FINAL", f_final, SY + 122, C_ACCENT, CW)
 
     # ── Marca de agua ──────────────────────────────────────────────────────
-    WM_H = 50
-    WM_Y = H - CARD_M - WM_H - 6
+    WM_H = 56
+    WM_Y = CH - CARD_M - WM_H - 10
 
     if os.path.exists(WATERMARK_PATH):
         try:
-            wm   = Image.open(WATERMARK_PATH).convert("RGBA")
+            wm    = Image.open(WATERMARK_PATH).convert("RGBA")
             ratio = WM_H / wm.height
             wm_w  = int(wm.width * ratio)
             wm    = wm.resize((wm_w, WM_H), Image.LANCZOS)
             r, g, b, a = wm.split()
-            a = a.point(lambda p: int(p * 0.88))
+            a = a.point(lambda p: int(p * 0.90))
             wm.putalpha(a)
-            canvas.alpha_composite(wm, ((W - wm_w) // 2, WM_Y))
+            canvas.alpha_composite(wm, ((CW - wm_w) // 2, WM_Y))
         except Exception as exc:
             logger.warning("Error marca de agua: %s", exc)
     else:
         brand = "t.me/iUniversoFootball"
         bw    = draw.textlength(brand, font=f_brand)
-        draw.text(((W-bw)/2, WM_Y+10), brand, font=f_brand, fill=C_ACCENT)
+        draw.text(((CW - bw) / 2, WM_Y + 14), brand, font=f_brand, fill=C_ACCENT)
 
     # ── Guardar ────────────────────────────────────────────────────────────
     OUTPUT_DIR.mkdir(exist_ok=True)
