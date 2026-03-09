@@ -187,3 +187,178 @@ def sofascore_raw_stats(home_name: str, away_name: str,
         {"statistics": to_list(home_s)},
         {"statistics": to_list(away_s)},
     ]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LIVESCORE — Reemplaza ESPN para partidos del día y estado en vivo
+# ══════════════════════════════════════════════════════════════════════════════
+
+# IDs de torneos de Sofascore que queremos monitorear
+# fmt: "Nombre legible": tournament_id
+_TOURNAMENT_IDS = {
+    # Italia
+    "Serie A":               23,
+    "Coppa Italia":          34,
+    "Supercopa de Italia":  498,
+    # España
+    "La Liga":                8,
+    "Copa del Rey":         329,
+    "Supercopa de España":  480,
+    # Francia
+    "Ligue 1":               34,
+    "Coupe de France":      152,
+    "Trophée des Champions": 480,
+    # Alemania
+    "Bundesliga":           35,
+    "DFB-Pokal":           189,
+    "Supercopa de Alemania": 440,
+    # Inglaterra
+    "Premier League":       17,
+    "FA Cup":              130,
+    "EFL Cup":             132,
+    "Community Shield":    480,
+    # UEFA
+    "Champions League":      7,
+    "Europa League":       679,
+    "Conference League":   17015,
+    "Supercopa de Europa":  480,
+    # CONMEBOL
+    "Copa Libertadores":    384,
+    "Copa Sudamericana":    480,
+    "Recopa Sudamericana":  480,
+    # Selecciones
+    "Nations League":       35,
+    "Eurocopa":            1,
+    "Copa América":       133,
+    "Clasificación UEFA":   679,
+    "Clasificación CONMEBOL": 42,
+    "Clasificación CONCACAF": 481,
+    "Mundial 2026":          16,
+    "Mundial de Clubes":  17626,
+}
+
+# Mapa estado Sofascore → nombres usados en bot.py
+_STATUS_MAP = {
+    "notstarted":  "STATUS_SCHEDULED",
+    "inprogress":  "STATUS_IN_PROGRESS",
+    "halftime":    "STATUS_HALFTIME",
+    "finished":    "STATUS_FULL_TIME",
+    "postponed":   "STATUS_POSTPONED",
+    "canceled":    "STATUS_CANCELED",
+    "awarded":     "STATUS_FINAL",
+}
+
+
+def get_events_by_date(date_str: str) -> list[dict]:
+    """
+    Devuelve todos los eventos de fútbol de una fecha dada.
+    date_str: "YYYY-MM-DD"
+    Cada evento tiene el mismo formato que parse_event() espera de ESPN.
+    """
+    data = _get(f"{_BASE}/sport/football/scheduled-events/{date_str}")
+    if not data:
+        return []
+    return [_normalize_event(ev) for ev in data.get("events", [])]
+
+
+def get_live_events() -> list[dict]:
+    """Devuelve los partidos de fútbol en vivo ahora mismo."""
+    data = _get(f"{_BASE}/sport/football/events/live")
+    if not data:
+        return []
+    return [_normalize_event(ev) for ev in data.get("events", [])]
+
+
+def get_event_by_id(event_id: int | str) -> dict | None:
+    """Devuelve el estado actual de un evento específico."""
+    data = _get(f"{_BASE}/event/{event_id}")
+    if not data:
+        return None
+    ev = data.get("event")
+    if not ev:
+        return None
+    return _normalize_event(ev)
+
+
+def _normalize_event(ev: dict) -> dict:
+    """
+    Convierte un evento de Sofascore al formato que usa bot.py
+    (compatible con parse_event de ESPN).
+    """
+    home = ev.get("homeTeam", {})
+    away = ev.get("awayTeam", {})
+    status = ev.get("status", {})
+    score  = ev.get("homeScore", {})
+    ascore = ev.get("awayScore", {})
+    tournament = ev.get("tournament", {})
+    category   = tournament.get("category", {})
+
+    st_type  = status.get("type", "notstarted").lower()
+    st_mapped = _STATUS_MAP.get(st_type, "STATUS_SCHEDULED")
+
+    # Minuto mostrado
+    clock = ""
+    time_data = ev.get("time", {})
+    played = time_data.get("played")
+    if played is not None:
+        clock = str(played)
+    elif st_type == "halftime":
+        clock = "HT"
+
+    # Hora de inicio (ISO)
+    start_ts = ev.get("startTimestamp")
+    date_iso = ""
+    kickoff_utc = None
+    if start_ts:
+        from datetime import datetime, timezone
+        kickoff_utc = datetime.fromtimestamp(start_ts, tz=timezone.utc)
+        date_iso = kickoff_utc.isoformat()
+
+    # Logo URLs de Sofascore
+    home_id = home.get("id", "")
+    away_id = away.get("id", "")
+    home_logo = f"https://api.sofascore.app/api/v1/team/{home_id}/image" if home_id else ""
+    away_logo = f"https://api.sofascore.app/api/v1/team/{away_id}/image" if away_id else ""
+
+    # Nombre de liga
+    league_name = tournament.get("name", "")
+    country = category.get("name", "")
+
+    return {
+        # Campos que usa bot.py directamente
+        "id":          str(ev.get("id", "")),
+        "date":        date_iso,
+        "kickoff_utc": kickoff_utc,
+        "_sofascore_id": ev.get("id"),
+        "_slug":       "",          # no aplica en Sofascore, se deja vacío
+        "_league":     league_name,
+        "_country":    country,
+        # Compatibilidad con parse_event de ESPN
+        "competitions": [{
+            "competitors": [
+                {
+                    "homeAway": "home",
+                    "score": str(score.get("current", 0) or 0),
+                    "team": {
+                        "displayName": home.get("name", "?"),
+                        "logo": home_logo,
+                    },
+                },
+                {
+                    "homeAway": "away",
+                    "score": str(ascore.get("current", 0) or 0),
+                    "team": {
+                        "displayName": away.get("name", "?"),
+                        "logo": away_logo,
+                    },
+                },
+            ],
+            "status": {
+                "type": {
+                    "name":        st_mapped,
+                    "description": st_type.capitalize(),
+                },
+                "displayClock": clock,
+            },
+        }],
+    }

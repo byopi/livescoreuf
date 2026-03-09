@@ -13,9 +13,11 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import requests
-from sofascore_stats import sofascore_raw_stats, find_sofascore_match_id
-from sofascore_stats import get_events_by_date, get_live_events, get_event_by_id
-from sofascore_stats import _get as sofascore_get, find_sofascore_match_id, _get as sofascore_get
+from sofascore_stats import (
+    sofascore_raw_stats, find_sofascore_match_id,
+    get_events_by_date, get_live_events, get_event_by_id,
+    _get as sofascore_get,
+)
 from lineup_image_generator import generate_lineup_images
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from telegram.ext import (
