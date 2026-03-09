@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import requests
+from sofascore_stats import sofascore_raw_stats
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from telegram.ext import (
     Application,
@@ -287,6 +288,7 @@ def parse_lineups(summary: dict) -> tuple[list[str], list[str]]:
 
 
 def parse_stats(summary: dict) -> tuple[dict, dict]:
+    """Fallback ESPN — solo se usa si Sofascore no devuelve datos."""
     MAP = {
         "possessionPct": "Posesion",
         "shotsOnTarget": "Tiros a puerta",
@@ -294,6 +296,7 @@ def parse_stats(summary: dict) -> tuple[dict, dict]:
         "corners":       "Corners",
         "fouls":         "Faltas",
         "yellowCards":   "Tarjetas amarillas",
+        "redCards":      "Tarjetas rojas",
     }
     home_s: dict = {}
     away_s: dict = {}
@@ -308,6 +311,17 @@ def parse_stats(summary: dict) -> tuple[dict, dict]:
                 except ValueError:
                     dest[key] = 0.0
     return home_s, away_s
+
+
+def build_raw_stats_from_espn(summary: dict) -> list[dict]:
+    """Convierte las stats de ESPN al formato raw_stats de image_generator."""
+    home_s, away_s = parse_stats(summary)
+    def to_list(d: dict) -> list[dict]:
+        return [{"type": k, "value": v} for k, v in d.items()]
+    return [
+        {"statistics": to_list(home_s)},
+        {"statistics": to_list(away_s)},
+    ]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -426,7 +440,6 @@ async def monitor_loop(app: Application):
                     img_path = None
                     if summary:
                         try:
-                            stats = parse_stats(summary)
                             fd = {
                                 "fixture": {"id": fid},
                                 "league":  {"name": fix.league_name},
@@ -436,10 +449,16 @@ async def monitor_loop(app: Application):
                                 },
                                 "goals": {"home": fix.home_score, "away": fix.away_score},
                             }
-                            raw_stats = [
-                                {"statistics": [{"type": k, "value": v} for k, v in stats[0].items()]},
-                                {"statistics": [{"type": k, "value": v} for k, v in stats[1].items()]},
-                            ]
+                            # Intentar Sofascore primero; fallback a ESPN
+                            raw_stats = await loop.run_in_executor(
+                                _executor, sofascore_raw_stats,
+                                fix.home_name, fix.away_name, None,
+                            )
+                            if raw_stats is None:
+                                logger.info("Sofascore sin datos, usando ESPN para stats de imagen.")
+                                raw_stats = build_raw_stats_from_espn(summary)
+                            else:
+                                logger.info("Stats de imagen obtenidas desde Sofascore.")
                             loop = asyncio.get_running_loop()
                             from image_generator import generate_match_summary
                             img_path = await loop.run_in_executor(
@@ -587,7 +606,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/partidos - Partidos del dia y activar monitoreo\n"
         "/activos  - Ver partidos monitoreados\n"
         "/stop     - Detener monitoreo de un partido\n"
-        "/test     - Preview del post final"
+        "/test     - Preview del post final\n"
+        "/preview  - Enviar al canal un ejemplo de alineaciones y gol"
     )
     await update.message.reply_text(text)
 
@@ -728,7 +748,6 @@ async def _run_test(event_id: str, slug: Optional[str], message: Message):
     warn = f"\n\nAtencion: Estado {st_desc} - el post es preview." if st_name not in ESPN_FINAL else ""
     await status_msg.edit_text(f"{home_name} {home_score}-{away_score} {away_name} | {league_n} - {st_desc}{warn}\n\nGenerando imagen...")
 
-    stats = parse_stats(summary)
     fd = {
         "fixture": {"id": event_id},
         "league":  {"name": league_n},
@@ -738,14 +757,19 @@ async def _run_test(event_id: str, slug: Optional[str], message: Message):
         },
         "goals": {"home": home_score, "away": away_score},
     }
-    raw_stats = [
-        {"statistics": [{"type": k, "value": v} for k, v in stats[0].items()]},
-        {"statistics": [{"type": k, "value": v} for k, v in stats[1].items()]},
-    ]
+    # Sofascore primero; fallback a ESPN
+    loop = asyncio.get_running_loop()
+    raw_stats = await loop.run_in_executor(
+        _executor, sofascore_raw_stats, home_name, away_name, None,
+    )
+    if raw_stats is None:
+        logger.info("Sofascore sin datos en /test, usando ESPN.")
+        raw_stats = build_raw_stats_from_espn(summary)
+    else:
+        logger.info("Stats de /test obtenidas desde Sofascore.")
 
     img_path = None
     try:
-        loop = asyncio.get_running_loop()
         from image_generator import generate_match_summary
         img_path = await loop.run_in_executor(_executor, generate_match_summary, fd, raw_stats)
     except Exception as exc:
@@ -837,6 +861,66 @@ async def cb_test(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await _run_test(parts[1], parts[2] if len(parts) > 2 else None, query.message)
 
 
+
+@admin_only
+async def cmd_preview(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    /preview — Envía al canal un mensaje de alineaciones y uno de gol de prueba,
+    para verificar que el formato se ve bien antes de un partido real.
+    """
+    dest = CHANNEL_ID if CHANNEL_ID else ADMIN_ID
+
+    # ── Datos ficticios ────────────────────────────────────────────────────
+    home  = "Real Madrid"
+    away  = "FC Barcelona"
+    league = "La Liga"
+
+    home_xi = [
+        "Lunin", "Carvajal", "Militao", "Rudiger", "Mendy",
+        "Valverde", "Camavinga", "Bellingham", "Rodrygo",
+        "Vinicius Jr.", "Mbappé",
+    ]
+    away_xi = [
+        "Ter Stegen", "Koundé", "Araujo", "I. Martínez", "Balde",
+        "Pedri", "Casadó", "Gavi", "Yamal",
+        "Lewandowski", "Raphinha",
+    ]
+
+    # ── 1. Alineaciones ────────────────────────────────────────────────────
+    text_lineup = msg_lineup(league, home, away, home_xi, away_xi)
+    try:
+        await ctx.bot.send_message(dest, text_lineup, parse_mode="Markdown")
+        await asyncio.sleep(1)
+    except Exception as exc:
+        logger.error("cmd_preview error enviando alineaciones: %s", exc)
+        await update.message.reply_text(f"Error enviando alineaciones: {exc}")
+        return
+
+    # ── 2. Gol ─────────────────────────────────────────────────────────────
+    text_goal = msg_goal(
+        home, away,
+        hs=1, as_=0,
+        league=league,
+        scorer="Vinicius Jr.",
+        assist="Bellingham",
+        side="home",
+        elapsed="34",
+    )
+    try:
+        await ctx.bot.send_message(dest, text_goal, parse_mode="Markdown")
+    except Exception as exc:
+        logger.error("cmd_preview error enviando gol: %s", exc)
+        await update.message.reply_text(f"Error enviando gol: {exc}")
+        return
+
+    destino = "el canal" if CHANNEL_ID else "tu DM"
+    await update.message.reply_text(
+        f"✅ Preview enviado a {destino}:\n"
+        f"• Alineaciones ({home} vs {away})\n"
+        f"• Gol de prueba (Vinicius Jr. 34')"
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # PUNTO DE ENTRADA
 # ══════════════════════════════════════════════════════════════════════════════
@@ -860,6 +944,7 @@ def main():
     app.add_handler(CommandHandler("activos",  cmd_activos))
     app.add_handler(CommandHandler("stop",     cmd_stop))
     app.add_handler(CommandHandler("test",     cmd_test))
+    app.add_handler(CommandHandler("preview",  cmd_preview))
     app.add_handler(CallbackQueryHandler(cb_toggle, pattern=r"^tog:"))
     app.add_handler(CallbackQueryHandler(cb_test,   pattern=r"^tst:"))
 
