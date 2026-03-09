@@ -13,7 +13,9 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import requests
-from sofascore_stats import sofascore_raw_stats
+from sofascore_stats import sofascore_raw_stats, find_sofascore_match_id
+from sofascore_stats import get_events_by_date, get_live_events, get_event_by_id
+from sofascore_stats import _get as sofascore_get, find_sofascore_match_id, _get as sofascore_get
 from lineup_image_generator import generate_lineup_images
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from telegram.ext import (
@@ -23,6 +25,8 @@ from telegram.ext import (
     ContextTypes,
 )
 from telegram.error import BadRequest
+from telegram import LinkPreviewOptions
+_NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
 # ─── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -127,18 +131,19 @@ class PendingGoal:
 
 @dataclass
 class TrackedFixture:
-    fixture_id:   str
-    league_slug:  str
-    home_name:    str
-    away_name:    str
-    league_name:  str
-    kickoff_utc:  Optional[datetime] = None
-    home_score:   int  = 0
-    away_score:   int  = 0
-    status:       str  = ""
-    finished:     bool = False
-    lineup_sent:  bool = False
-    lineup_tries: int  = 0
+    fixture_id:     str
+    league_slug:    str
+    home_name:      str
+    away_name:      str
+    league_name:    str
+    kickoff_utc:    Optional[datetime] = None
+    home_score:     int  = 0
+    away_score:     int  = 0
+    status:         str  = ""
+    finished:       bool = False
+    lineup_sent:    bool = False
+    lineup_tries:   int  = 0
+    _sofascore_id:  Optional[str] = None   # ID en Sofascore para livescore
 
 
 # ─── Estado global ─────────────────────────────────────────────────────────────
@@ -172,16 +177,29 @@ def _fetch_summary(slug: str, event_id: str) -> Optional[dict]:
 
 def _fetch_all_today() -> list[dict]:
     """
-    Consulta todas las ligas y devuelve partidos del dia.
-    Acepta partidos de hoy en UTC-4 O en UTC para no perder
-    partidos nocturnos/madrugada según dónde corra el servidor.
+    Devuelve partidos del día usando Sofascore como fuente principal.
+    ESPN se usa como fallback si Sofascore no responde.
     """
-    today_local = datetime.now(TZ).date()
     today_utc   = datetime.now(timezone.utc).date()
-    valid_dates = {today_local, today_utc}
+    today_local = datetime.now(TZ).date()
 
+    # ── Sofascore (fuente principal) ───────────────────────────────────────
     results = []
-    seen = set()
+    seen    = set()
+    for date_str in {str(today_utc), str(today_local)}:
+        for ev in get_events_by_date(date_str):
+            if ev["id"] in seen:
+                continue
+            seen.add(ev["id"])
+            results.append(ev)
+
+    if results:
+        logger.info("Sofascore: %d partidos hoy", len(results))
+        return results
+
+    # ── ESPN fallback ──────────────────────────────────────────────────────
+    logger.warning("Sofascore sin datos, usando ESPN como fallback")
+    valid_dates = {today_local, today_utc}
     for league_name, slug in ESPN_LEAGUES.items():
         for ev in _fetch_scoreboard(slug):
             if ev["id"] in seen:
@@ -191,7 +209,6 @@ def _fetch_all_today() -> list[dict]:
             if raw:
                 try:
                     dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-                    # Incluir si el partido cae en hoy (UTC-4) o hoy (UTC)
                     include = (dt.astimezone(TZ).date() in valid_dates or
                                dt.astimezone(timezone.utc).date() in valid_dates)
                 except Exception:
@@ -391,15 +408,14 @@ def build_raw_stats_from_espn(summary: dict) -> list[dict]:
 def msg_goal(home: str, away: str, hs: int, as_: int,
              league: str, scorer: str, assist: str,
              side: str = "", elapsed: str = "") -> str:
-    assist_line = f"🅰️ {assist}" if assist and assist != "-" else "🅰️ -"
     minute = f"⌚ {elapsed}'" if elapsed and elapsed != "0" else ""
 
     if side == "home":
-        score = f"[{hs}]-{as_}"
+        score = f"[{hs}]\u2013{as_}"
     elif side == "away":
-        score = f"{hs}-[{as_}]"
+        score = f"{hs}\u2013[{as_}]"
     else:
-        score = f"[{hs}-{as_}]"
+        score = f"{hs}\u2013{as_}"
 
     lines = [
         "*🥅 | GOOOOOL!*",
@@ -409,7 +425,15 @@ def msg_goal(home: str, away: str, hs: int, as_: int,
     ]
     if minute:
         lines.append(minute)
-    lines += [f"⚽ {scorer}", assist_line, "", "*📲 Suscribete en t.me/iUniversoFootball*"]
+
+    # Goleador: si aún no se conoce muestra solo el emoji con guion
+    lines.append(f"⚽ {scorer}")
+
+    # Asistencia: omitir la línea si no hay datos aún
+    if assist and assist != "-":
+        lines.append(f"🅰️ {assist}")
+
+    lines += ["", "*📲 Suscribete en t.me/iUniversoFootball*"]
     return "\n".join(lines)
 
 
@@ -453,12 +477,21 @@ async def monitor_loop(app: Application):
             if fix.finished:
                 continue
             try:
-                events = await fetch_scoreboard(fix.league_slug)
-                raw = next((e for e in events if e["id"] == fid), None)
-                if not raw:
-                    continue
-                raw["_slug"]   = fix.league_slug
-                raw["_league"] = fix.league_name
+                loop = asyncio.get_running_loop()
+                # Sofascore primero para estado en vivo; fallback a ESPN
+                sf_id = getattr(fix, "_sofascore_id", None) or fid
+                raw = await loop.run_in_executor(_executor, get_event_by_id, sf_id)
+                if raw:
+                    raw["_slug"]   = fix.league_slug
+                    raw["_league"] = fix.league_name
+                else:
+                    # Fallback ESPN
+                    events = await fetch_scoreboard(fix.league_slug)
+                    raw = next((e for e in events if e["id"] == fid), None)
+                    if not raw:
+                        continue
+                    raw["_slug"]   = fix.league_slug
+                    raw["_league"] = fix.league_name
                 p = parse_event(raw)
 
                 new_h  = p["home_score"]
@@ -477,7 +510,7 @@ async def monitor_loop(app: Application):
                     dest = CHANNEL_ID if CHANNEL_ID else ADMIN_ID
                     for _ in range(max(dh + da, 1)):
                         text = msg_goal(fix.home_name, fix.away_name, new_h, new_a,
-                                        fix.league_name, "⏳ Obteniendo...", "⏳ Obteniendo...",
+                                        fix.league_name, "-", "-",
                                         side, clock)
                         try:
                             sent = await app.bot.send_message(chat_id=dest, text=text, parse_mode="Markdown", disable_web_page_preview=True)
@@ -510,6 +543,7 @@ async def monitor_loop(app: Application):
                                 "goals": {"home": fix.home_score, "away": fix.away_score},
                             }
                             # Intentar Sofascore primero; fallback a ESPN
+                            loop = asyncio.get_running_loop()
                             raw_stats = await loop.run_in_executor(
                                 _executor, sofascore_raw_stats,
                                 fix.home_name, fix.away_name, None,
@@ -519,7 +553,6 @@ async def monitor_loop(app: Application):
                                 raw_stats = build_raw_stats_from_espn(summary)
                             else:
                                 logger.info("Stats de imagen obtenidas desde Sofascore.")
-                            loop = asyncio.get_running_loop()
                             from image_generator import generate_match_summary
                             img_path = await loop.run_in_executor(
                                 _executor, generate_match_summary, fd, raw_stats
@@ -558,26 +591,51 @@ async def resolve_loop(app: Application):
 
         for fid, goals in by_fix.items():
             try:
-                summary = await fetch_summary(goals[0].league_slug, fid)
-                if not summary:
-                    for pg in goals:
-                        pg.elapsed_secs += RESOLVE_INTERVAL
+                unresolved = [g for g in goals if not g.resolved]
+                if not unresolved:
                     continue
 
-                key_evs    = parse_key_events(summary)
-                seen       = resolved_kev.setdefault(fid, set())
-                unresolved = [g for g in goals if not g.resolved]
+                pg0    = goals[0]
+                seen   = resolved_kev.setdefault(fid, set())
+                scored = []   # lista de (scorer, assist) obtenidos
 
-                for kev in key_evs:
-                    kid = str(kev.get("id", ""))
-                    if kid in seen:
-                        continue
-                    scorer, assist = parse_goal_event(kev)
-                    if not scorer:
-                        continue
+                # ── Fuente 1: Sofascore (más rápido para goleador) ─────────
+                loop = asyncio.get_running_loop()
+                sf_id = await loop.run_in_executor(
+                    _executor, find_sofascore_match_id, pg0.home_name, pg0.away_name
+                )
+                if sf_id:
+                    sf_data = await loop.run_in_executor(
+                        _executor, sofascore_get, f"https://www.sofascore.com/api/v1/event/{sf_id}/incidents"
+                    )
+                    if sf_data:
+                        for inc in sf_data.get("incidents", []):
+                            if inc.get("incidentType") not in ("goal", "penalty"):
+                                continue
+                            kid = f"sf_{sf_id}_{inc.get('time',0)}_{inc.get('player',{}).get('id','')}"
+                            if kid in seen:
+                                continue
+                            scorer = inc.get("player", {}).get("name", "") or "-"
+                            assist_player = inc.get("assist1", {}) or {}
+                            assist = assist_player.get("name", "") or "-"
+                            scored.append((scorer, assist, kid))
+
+                # ── Fuente 2: ESPN (fallback) ──────────────────────────────
+                if not scored:
+                    summary = await fetch_summary(pg0.league_slug, fid)
+                    if summary:
+                        for kev in parse_key_events(summary):
+                            kid = str(kev.get("id", ""))
+                            if kid in seen:
+                                continue
+                            scorer, assist = parse_goal_event(kev)
+                            if scorer:
+                                scored.append((scorer, assist or "-", kid))
+
+                # ── Asignar goles a mensajes pendientes ────────────────────
+                for scorer, assist, kid in scored:
                     if not unresolved:
                         break
-
                     pg = unresolved.pop(0)
                     seen.add(kid)
                     pg.scorer   = scorer
@@ -588,25 +646,31 @@ async def resolve_loop(app: Application):
                                     pg.league_name, scorer, assist, pg.goal_side, pg.elapsed)
                     if pg.tg_message:
                         try:
-                            await pg.tg_message.edit_text(text, parse_mode="Markdown")
+                            await pg.tg_message.edit_text(
+                                text, parse_mode="Markdown", link_preview_options=_NO_PREVIEW
+                            )
                         except BadRequest:
                             pass
                         except Exception as exc:
                             logger.error("Error editando gol: %s", exc)
 
+                # ── Timeout: marcar los que llevan demasiado tiempo ────────
                 for pg in goals:
                     if not pg.resolved:
                         pg.elapsed_secs += RESOLVE_INTERVAL
                         if pg.elapsed_secs >= RESOLVE_TIMEOUT:
                             pg.resolved = True
                             text = msg_goal(pg.home_name, pg.away_name, pg.home_score, pg.away_score,
-                                            pg.league_name, "No disponible", "-",
+                                            pg.league_name, "-", "-",
                                             pg.goal_side, pg.elapsed)
                             if pg.tg_message:
                                 try:
-                                    await pg.tg_message.edit_text(text, parse_mode="Markdown")
+                                    await pg.tg_message.edit_text(
+                                        text, parse_mode="Markdown", link_preview_options=_NO_PREVIEW
+                                    )
                                 except Exception:
                                     pass
+
             except Exception as exc:
                 logger.error("resolve_loop error: %s", exc)
 
@@ -1053,16 +1117,23 @@ async def cb_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 raw["_slug"]   = slug
                 raw["_league"] = next((n for n, s in ESPN_LEAGUES.items() if s == slug), slug)
                 p = parse_event(raw)
+                # Intentar obtener ID de Sofascore para livescore
+                sf_id = None
+                try:
+                    sf_id = find_sofascore_match_id(p["home_name"], p["away_name"])
+                except Exception:
+                    pass
                 tracked[fid] = TrackedFixture(
-                    fixture_id  = fid,
-                    league_slug = slug,
-                    home_name   = p["home_name"],
-                    away_name   = p["away_name"],
-                    league_name = raw["_league"],
-                    kickoff_utc = p["kickoff_utc"],
-                    home_score  = p["home_score"],
-                    away_score  = p["away_score"],
-                    status      = p["status_type"],
+                    fixture_id    = fid,
+                    league_slug   = slug,
+                    home_name     = p["home_name"],
+                    away_name     = p["away_name"],
+                    league_name   = raw["_league"],
+                    kickoff_utc   = p["kickoff_utc"],
+                    home_score    = p["home_score"],
+                    away_score    = p["away_score"],
+                    status        = p["status_type"],
+                    _sofascore_id = str(sf_id) if sf_id else None,
                 )
                 await query.answer(f"Activado: {p['home_name']} vs {p['away_name']}", show_alert=True)
             else:
