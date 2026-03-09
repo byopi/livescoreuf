@@ -149,6 +149,12 @@ def from_apisports(team_id: int) -> Image.Image | None:
         return None
     return get_url(f"https://media.api-sports.io/football/teams/{team_id}.png")
 
+def sanitize_filename(name: str) -> str:
+    bad = ["/", chr(92), ":", "*", "?", chr(34), "<", ">", "|"]
+    for ch in bad:
+        name = name.replace(ch, "-")
+    return name.strip()
+
 def fetch_espn_teams(slug: str) -> list[dict]:
     """
     Consulta el scoreboard de ESPN y extrae todos los equipos únicos
@@ -241,7 +247,7 @@ def main():
     failed = []
 
     for i, (name, espn_logo) in enumerate(all_teams.items(), 1):
-        out = OUT_DIR / f"{name}.png"
+        out = OUT_DIR / f"{sanitize_filename(name)}.png"
         if out.exists():
             print(f"  [{i:4}/{total}] ✓ existe        {name}")
             ok += 1

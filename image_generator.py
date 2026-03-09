@@ -187,7 +187,10 @@ def _get_logo(team_name: str, espn_url: str = "") -> Optional[Image.Image]:
     img = None
 
     # 2. Archivo local pre-descargado
-    local_path = LOGOS_DIR / f"{team_name}.png"
+    _safe_name = team_name
+    for _ch in ["/", chr(92), ":", "*", "?", chr(34), "<", ">", "|"]:
+        _safe_name = _safe_name.replace(_ch, "-")
+    local_path = LOGOS_DIR / f"{_safe_name}.png"
     if local_path.exists():
         try:
             img = Image.open(str(local_path)).convert("RGBA")
