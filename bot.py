@@ -664,18 +664,29 @@ async def _send_lineup_images(
     from telegram import InputMediaPhoto
     loop = asyncio.get_running_loop()
     try:
+        # run_in_executor solo acepta *args, usamos lambda para pasar kwargs
         path_home, path_away = await loop.run_in_executor(
-            _executor, generate_lineup_images,
-            home_name, away_name, home_xi, away_xi,
-            home_formation, away_formation,
-            home_logo_url, away_logo_url,
-            league_name, str(match_id),
+            _executor,
+            lambda: generate_lineup_images(
+                home_name=home_name,
+                away_name=away_name,
+                home_xi=home_xi,
+                away_xi=away_xi,
+                home_formation=home_formation,
+                away_formation=away_formation,
+                home_logo_url=home_logo_url,
+                away_logo_url=away_logo_url,
+                league_name=league_name,
+                match_id=str(match_id),
+            ),
         )
-        media = [
-            InputMediaPhoto(open(path_home, "rb")),
-            InputMediaPhoto(open(path_away, "rb"), caption=caption_text, parse_mode="Markdown"),
-        ]
-        await app.bot.send_media_group(dest, media)
+        # Leer bytes antes de pasarlos a InputMediaPhoto
+        with open(path_home, "rb") as f_home, open(path_away, "rb") as f_away:
+            media = [
+                InputMediaPhoto(media=f_home.read()),
+                InputMediaPhoto(media=f_away.read(), caption=caption_text, parse_mode="Markdown"),
+            ]
+        await app.bot.send_media_group(chat_id=dest, media=media)
     except Exception as exc:
         logger.error("Error enviando imágenes de lineup: %s", exc)
         # Fallback: enviar solo texto
@@ -1077,7 +1088,7 @@ async def cmd_testlineup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     try:
         await _send_lineup_images(
-            update.get_bot(), update.effective_user.id,
+            ctx.application, update.effective_user.id,
             "FC Barcelona", "Real Madrid",
             home_xi, away_xi,
             "4-3-3", "4-3-3",
