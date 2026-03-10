@@ -19,7 +19,7 @@ from sofascore_stats import (
     _get as sofascore_get,
 )
 from lineup_image_generator import generate_lineup_images
-from fotmob_stats import get_scorer_assist, find_fotmob_match_id
+from fotmob_stats import get_scorer_assist, find_fotmob_match_id, get_latest_goal_fast
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from telegram.ext import (
     Application,
@@ -595,17 +595,86 @@ async def monitor_loop(app: Application):
                 logger.error("monitor_loop error en %s: %s", fid, exc)
 
 
+async def _fetch_scorer(home: str, away: str, league_slug: str,
+                        fid: str, seen: set, loop) -> list[tuple]:
+    """
+    Intenta obtener goleadores desde FotMob → Sofascore → ESPN.
+    Devuelve lista de (scorer, assist, kid) con datos reales (no "-").
+    """
+    scored = []
+
+    # ── FotMob ────────────────────────────────────────────────────────────────
+    fm_results = await loop.run_in_executor(
+        _executor, get_scorer_assist, home, away, None,
+    )
+    for scorer, assist, kid in fm_results:
+        if kid not in seen and scorer and scorer != "-":
+            scored.append((scorer, assist or "", kid))
+
+    # ── Sofascore ─────────────────────────────────────────────────────────────
+    if not scored:
+        sf_id = await loop.run_in_executor(
+            _executor, find_sofascore_match_id, home, away,
+        )
+        if sf_id:
+            sf_data = await loop.run_in_executor(
+                _executor, sofascore_get,
+                f"https://www.sofascore.com/api/v1/event/{sf_id}/incidents",
+            )
+            if sf_data:
+                for inc in sf_data.get("incidents", []):
+                    if inc.get("incidentType") not in ("goal", "penalty"):
+                        continue
+                    kid = f"sf_{sf_id}_{inc.get('time',0)}_{inc.get('player',{}).get('id','')}"
+                    if kid in seen:
+                        continue
+                    scorer = (inc.get("player") or {}).get("name", "")
+                    if not scorer:
+                        continue
+                    assist = (inc.get("assist1") or {}).get("name", "") or ""
+                    scored.append((scorer, assist, kid))
+
+    # ── ESPN ──────────────────────────────────────────────────────────────────
+    if not scored:
+        summary = await fetch_summary(league_slug, fid)
+        if summary:
+            for kev in parse_key_events(summary):
+                kid = str(kev.get("id", ""))
+                if kid in seen:
+                    continue
+                scorer, assist = parse_goal_event(kev)
+                if scorer and scorer != "-":
+                    scored.append((scorer, assist or "", kid))
+
+    return scored
+
+
 async def resolve_loop(app: Application):
+    """
+    Polling agresivo: cuando hay goles pendientes consulta cada 4s.
+    Solo edita el mensaje cuando tiene el goleador real (nunca edita con "-").
+    Si supera el timeout, simplemente deja el mensaje como está.
+    """
     logger.info("resolve_loop iniciado")
+    FAST_INTERVAL = 4   # segundos entre intentos cuando hay gol pendiente
+    IDLE_INTERVAL = 10  # segundos cuando no hay nada pendiente
+
     while True:
-        await asyncio.sleep(RESOLVE_INTERVAL)
         if not pending_goals:
+            await asyncio.sleep(IDLE_INTERVAL)
             continue
 
+        # Agrupar por partido
         by_fix: dict[str, list[PendingGoal]] = {}
         for pg in pending_goals:
             if not pg.resolved:
                 by_fix.setdefault(pg.fixture_id, []).append(pg)
+
+        if not by_fix:
+            await asyncio.sleep(IDLE_INTERVAL)
+            continue
+
+        loop = asyncio.get_running_loop()
 
         for fid, goals in by_fix.items():
             try:
@@ -613,55 +682,15 @@ async def resolve_loop(app: Application):
                 if not unresolved:
                     continue
 
-                pg0    = goals[0]
-                seen   = resolved_kev.setdefault(fid, set())
-                scored = []   # lista de (scorer, assist, kid)
-                loop   = asyncio.get_running_loop()
+                pg0  = goals[0]
+                seen = resolved_kev.setdefault(fid, set())
 
-                # ── Fuente 1: FotMob (más rápido, ~10-15s tras el gol) ─────
-                fm_results = await loop.run_in_executor(
-                    _executor, get_scorer_assist,
-                    pg0.home_name, pg0.away_name, None,
+                scored = await _fetch_scorer(
+                    pg0.home_name, pg0.away_name,
+                    pg0.league_slug, fid, seen, loop,
                 )
-                for scorer, assist, kid in fm_results:
-                    if kid not in seen:
-                        scored.append((scorer, assist or "-", kid))
 
-                # ── Fuente 2: Sofascore (fallback) ─────────────────────────
-                if not scored:
-                    sf_id = await loop.run_in_executor(
-                        _executor, find_sofascore_match_id,
-                        pg0.home_name, pg0.away_name,
-                    )
-                    if sf_id:
-                        sf_data = await loop.run_in_executor(
-                            _executor, sofascore_get,
-                            f"https://www.sofascore.com/api/v1/event/{sf_id}/incidents",
-                        )
-                        if sf_data:
-                            for inc in sf_data.get("incidents", []):
-                                if inc.get("incidentType") not in ("goal", "penalty"):
-                                    continue
-                                kid = f"sf_{sf_id}_{inc.get('time',0)}_{inc.get('player',{}).get('id','')}"
-                                if kid in seen:
-                                    continue
-                                scorer = inc.get("player", {}).get("name", "") or "-"
-                                assist = (inc.get("assist1") or {}).get("name", "") or "-"
-                                scored.append((scorer, assist, kid))
-
-                # ── Fuente 3: ESPN (último recurso) ────────────────────────
-                if not scored:
-                    summary = await fetch_summary(pg0.league_slug, fid)
-                    if summary:
-                        for kev in parse_key_events(summary):
-                            kid = str(kev.get("id", ""))
-                            if kid in seen:
-                                continue
-                            scorer, assist = parse_goal_event(kev)
-                            if scorer:
-                                scored.append((scorer, assist or "-", kid))
-
-                # ── Asignar goles a mensajes pendientes ────────────────────
+                # ── Asignar a mensajes pendientes ──────────────────────────
                 for scorer, assist, kid in scored:
                     if not unresolved:
                         break
@@ -671,39 +700,45 @@ async def resolve_loop(app: Application):
                     pg.assist   = assist
                     pg.resolved = True
 
-                    text = msg_goal(pg.home_name, pg.away_name, pg.home_score, pg.away_score,
-                                    pg.league_name, scorer, assist, pg.goal_side, pg.elapsed)
+                    # Solo editar si tenemos goleador real
+                    text = msg_goal(
+                        pg.home_name, pg.away_name,
+                        pg.home_score, pg.away_score,
+                        pg.league_name, scorer, assist,
+                        pg.goal_side, pg.elapsed,
+                    )
                     if pg.tg_message:
                         try:
                             await pg.tg_message.edit_text(
-                                text, parse_mode="Markdown", link_preview_options=_NO_PREVIEW
+                                text, parse_mode="Markdown",
+                                link_preview_options=_NO_PREVIEW,
                             )
+                            logger.info("Gol editado: %s (%s)", scorer, pg.home_name)
                         except BadRequest:
                             pass
                         except Exception as exc:
                             logger.error("Error editando gol: %s", exc)
 
-                # ── Timeout: marcar los que llevan demasiado tiempo ────────
+                # ── Timeout: dejar el mensaje como está, solo marcar resuelto
                 for pg in goals:
                     if not pg.resolved:
-                        pg.elapsed_secs += RESOLVE_INTERVAL
+                        pg.elapsed_secs += FAST_INTERVAL
                         if pg.elapsed_secs >= RESOLVE_TIMEOUT:
                             pg.resolved = True
-                            text = msg_goal(pg.home_name, pg.away_name, pg.home_score, pg.away_score,
-                                            pg.league_name, "-", "-",
-                                            pg.goal_side, pg.elapsed)
-                            if pg.tg_message:
-                                try:
-                                    await pg.tg_message.edit_text(
-                                        text, parse_mode="Markdown", link_preview_options=_NO_PREVIEW
-                                    )
-                                except Exception:
-                                    pass
+                            logger.warning(
+                                "Timeout sin goleador: %s vs %s, minuto %s",
+                                pg.home_name, pg.away_name, pg.elapsed,
+                            )
+                            # No se edita el mensaje — queda con "⚽ -"
 
             except Exception as exc:
-                logger.error("resolve_loop error: %s", exc)
+                logger.error("resolve_loop error en %s: %s", fid, exc)
 
         pending_goals[:] = [pg for pg in pending_goals if not pg.resolved]
+
+        # Dormir poco si siguen pendientes, más si ya no hay
+        remaining = sum(1 for pg in pending_goals if not pg.resolved)
+        await asyncio.sleep(FAST_INTERVAL if remaining else IDLE_INTERVAL)
 
 
 async def lineup_loop(app: Application):
@@ -1273,8 +1308,44 @@ async def cb_lineup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     if query.from_user.id != ADMIN_ID:
         return
+
     fid = query.data.split(":")[1]
-    await _force_lineup(fid, query.message, ctx.application)
+    fix = tracked.get(fid)
+    if not fix:
+        try:
+            await query.edit_message_text("Partido no encontrado en monitoreo.")
+        except Exception:
+            pass
+        return
+
+    msg = await query.message.reply_text(
+        f"Obteniendo alineaciones de {fix.home_name} vs {fix.away_name}..."
+    )
+    summary = await fetch_summary(fix.league_slug, fid)
+    if not summary:
+        await msg.edit_text("No se pudo obtener datos de ESPN.")
+        return
+
+    home_xi, away_xi, home_f, away_f, home_logo, away_logo = parse_lineups(summary)
+    if len(home_xi) < 11 or len(away_xi) < 11:
+        await msg.edit_text(
+            f"Alineaciones incompletas: {fix.home_name} ({len(home_xi)}) "
+            f"vs {fix.away_name} ({len(away_xi)}). ESPN aún no las publicó."
+        )
+        return
+
+    await msg.edit_text("Generando imágenes...")
+    caption = msg_lineup(fix.league_name, fix.home_name, fix.away_name, home_xi, away_xi)
+    dest    = CHANNEL_ID if CHANNEL_ID else ADMIN_ID
+    await _send_lineup_images(
+        ctx.application, dest,
+        fix.home_name, fix.away_name,
+        home_xi, away_xi, home_f, away_f,
+        home_logo, away_logo,
+        fix.league_name, fid, caption,
+    )
+    fix.lineup_sent = True
+    await msg.edit_text(f"✅ Alineaciones enviadas al canal.")
 
 
 @admin_only
