@@ -19,7 +19,7 @@ from sofascore_stats import (
     _get as sofascore_get,
 )
 from lineup_image_generator import generate_lineup_images
-from fotmob_stats import get_scorer_assist, find_fotmob_match_id, get_latest_goal_fast
+from fotmob_stats import get_scorer_assist, find_fotmob_match_id
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from telegram.ext import (
     Application,
