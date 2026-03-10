@@ -59,7 +59,7 @@ _STAT_MAP = {
 # ─── HTTP ──────────────────────────────────────────────────────────────────────
 
 def _get(url: str) -> dict | None:
-    time.sleep(1.5)
+    time.sleep(0.3)
     for attempt in range(3):
         try:
             r = requests.get(url, headers=_HEADERS, timeout=10)

@@ -107,7 +107,7 @@ ESPN_FINAL  = {"STATUS_FINAL", "STATUS_FULL_TIME"}
 ESPN_LIVE   = {"STATUS_IN_PROGRESS", "STATUS_HALFTIME"}
 
 # Thread pool para requests HTTP (no bloquean el event loop)
-_executor = ThreadPoolExecutor(max_workers=8)
+_executor = ThreadPoolExecutor(max_workers=16)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -153,6 +153,10 @@ class TrackedFixture:
 tracked:       dict[str, TrackedFixture] = {}
 pending_goals: list[PendingGoal]         = []
 resolved_kev:  dict[str, set]            = {}
+
+# Cache de eventos del día: {event_id: raw_event_dict}
+# Se rellena en /partidos y se reutiliza en cb_toggle sin re-consultar ESPN
+_events_cache: dict[str, dict] = {}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -481,8 +485,19 @@ async def monitor_loop(app: Application):
                 continue
             try:
                 loop = asyncio.get_running_loop()
+                # Buscar sofascore_id si aún no lo tenemos (se pospuso del callback)
+                if not fix._sofascore_id:
+                    sf_id = await loop.run_in_executor(
+                        _executor, find_sofascore_match_id,
+                        fix.home_name, fix.away_name,
+                    )
+                    if sf_id:
+                        fix._sofascore_id = str(sf_id)
+                        logger.info("Sofascore ID encontrado para %s vs %s: %s",
+                                    fix.home_name, fix.away_name, sf_id)
+
                 # Sofascore primero para estado en vivo; fallback a ESPN
-                sf_id = getattr(fix, "_sofascore_id", None) or fid
+                sf_id = fix._sofascore_id or fid
                 raw = await loop.run_in_executor(_executor, get_event_by_id, sf_id)
                 if raw:
                     raw["_slug"]   = fix.league_slug
@@ -945,6 +960,10 @@ async def cmd_partidos(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     await msg.delete()
 
+    # Guardar eventos en cache para que cb_toggle no necesite re-consultar ESPN
+    for ev in all_events:
+        _events_cache[ev["id"]] = ev
+
     by_league: dict[str, list] = {}
     for ev in all_events:
         by_league.setdefault(ev.get("_league", "Otra"), []).append(ev)
@@ -1112,7 +1131,7 @@ async def _run_test(event_id: str, slug: Optional[str], message: Message):
 
 async def cb_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    # Responder INMEDIATAMENTE antes de cualquier operación lenta
+    # Responder INMEDIATAMENTE — Telegram invalida el query tras 60s
     await query.answer()
     if query.from_user.id != ADMIN_ID:
         return
@@ -1122,65 +1141,66 @@ async def cb_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     slug  = parts[2] if len(parts) > 2 else ""
 
     if fid in tracked:
+        # ── Desactivar — instantáneo, sin HTTP ────────────────────────────
         tracked.pop(fid)
-        label_feedback = "Partido desactivado."
     else:
-        try:
-            events = await fetch_scoreboard(slug)
-            raw = next((e for e in events if e["id"] == fid), None)
-            if not raw:
-                await query.edit_message_text("No se encontró el partido. Intenta /partidos de nuevo.")
-                return
-            raw["_slug"]   = slug
-            raw["_league"] = next((n for n, s in ESPN_LEAGUES.items() if s == slug), slug)
-            p = parse_event(raw)
-
-            # Buscar ID de Sofascore en background sin bloquear
-            loop = asyncio.get_running_loop()
-            sf_id = None
+        # ── Activar — usar cache si existe, ESPN solo si no ───────────────
+        raw = _events_cache.get(fid)
+        if raw is None:
+            # No estaba en cache (raro), consultar ESPN como fallback
             try:
-                sf_id = await loop.run_in_executor(
-                    _executor, find_sofascore_match_id, p["home_name"], p["away_name"]
+                events = await fetch_scoreboard(slug)
+                raw = next((e for e in events if e["id"] == fid), None)
+                if raw:
+                    _events_cache[fid] = raw
+            except Exception as exc:
+                logger.error("cb_toggle fetch error: %s", exc)
+
+        if not raw:
+            try:
+                await query.edit_message_text(
+                    "No se encontró el partido. Refresca con /partidos."
                 )
             except Exception:
                 pass
-
-            tracked[fid] = TrackedFixture(
-                fixture_id    = fid,
-                league_slug   = slug,
-                home_name     = p["home_name"],
-                away_name     = p["away_name"],
-                league_name   = raw["_league"],
-                kickoff_utc   = p["kickoff_utc"],
-                home_score    = p["home_score"],
-                away_score    = p["away_score"],
-                status        = p["status_type"],
-                _sofascore_id = str(sf_id) if sf_id else None,
-            )
-            label_feedback = f"Activado: {p['home_name']} vs {p['away_name']}"
-        except Exception as exc:
-            logger.error("cb_toggle error: %s", exc)
-            await query.edit_message_text(f"Error al activar: {exc}")
             return
 
-    # Refrescar teclado en background para no bloquear la respuesta
-    async def _refresh_keyboard():
-        try:
-            events = await fetch_scoreboard(slug)
+        raw.setdefault("_slug",   slug)
+        raw.setdefault("_league", next((n for n, s in ESPN_LEAGUES.items() if s == slug), slug))
+        p = parse_event(raw)
+
+        tracked[fid] = TrackedFixture(
+            fixture_id    = fid,
+            league_slug   = slug,
+            home_name     = p["home_name"],
+            away_name     = p["away_name"],
+            league_name   = raw["_league"],
+            kickoff_utc   = p["kickoff_utc"],
+            home_score    = p["home_score"],
+            away_score    = p["away_score"],
+            status        = p["status_type"],
+            _sofascore_id = None,   # se busca en background abajo
+        )
+
+        # Sofascore ID se buscará en el primer ciclo del monitor_loop
+        # No hacerlo aquí para no ralentizar la respuesta del botón
+
+    # ── Refrescar teclado desde cache — instantáneo, sin HTTP ─────────────
+    try:
+        # Agrupar los eventos del mismo slug que hay en cache
+        slug_events = [ev for ev in _events_cache.values()
+                       if ev.get("_slug") == slug]
+        if slug_events:
             keyboard = []
-            for ev in events:
-                ev["_slug"]   = slug
-                ev["_league"] = ""
+            for ev in slug_events:
                 p   = parse_event(ev)
                 act = "✅ " if p["id"] in tracked else ""
                 hora = p["kickoff_str"] or "--:--"
                 label = f"{act}{hora} | {p['home_name']} vs {p['away_name']} ({p['home_score']}-{p['away_score']}) {p['status_desc']}"
                 keyboard.append([InlineKeyboardButton(label, callback_data=f"tog:{p['id']}:{slug}")])
             await query.edit_message_reply_markup(InlineKeyboardMarkup(keyboard))
-        except Exception:
-            pass
-
-    asyncio.create_task(_refresh_keyboard())
+    except Exception:
+        pass
 
 
 async def cb_test(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
