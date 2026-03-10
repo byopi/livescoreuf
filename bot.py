@@ -19,6 +19,7 @@ from sofascore_stats import (
     _get as sofascore_get,
 )
 from lineup_image_generator import generate_lineup_images
+from fotmob_stats import get_scorer_assist, find_fotmob_match_id
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from telegram.ext import (
     Application,
@@ -599,30 +600,41 @@ async def resolve_loop(app: Application):
 
                 pg0    = goals[0]
                 seen   = resolved_kev.setdefault(fid, set())
-                scored = []   # lista de (scorer, assist) obtenidos
+                scored = []   # lista de (scorer, assist, kid)
+                loop   = asyncio.get_running_loop()
 
-                # ── Fuente 1: Sofascore (más rápido para goleador) ─────────
-                loop = asyncio.get_running_loop()
-                sf_id = await loop.run_in_executor(
-                    _executor, find_sofascore_match_id, pg0.home_name, pg0.away_name
+                # ── Fuente 1: FotMob (más rápido, ~10-15s tras el gol) ─────
+                fm_results = await loop.run_in_executor(
+                    _executor, get_scorer_assist,
+                    pg0.home_name, pg0.away_name, None,
                 )
-                if sf_id:
-                    sf_data = await loop.run_in_executor(
-                        _executor, sofascore_get, f"https://www.sofascore.com/api/v1/event/{sf_id}/incidents"
-                    )
-                    if sf_data:
-                        for inc in sf_data.get("incidents", []):
-                            if inc.get("incidentType") not in ("goal", "penalty"):
-                                continue
-                            kid = f"sf_{sf_id}_{inc.get('time',0)}_{inc.get('player',{}).get('id','')}"
-                            if kid in seen:
-                                continue
-                            scorer = inc.get("player", {}).get("name", "") or "-"
-                            assist_player = inc.get("assist1", {}) or {}
-                            assist = assist_player.get("name", "") or "-"
-                            scored.append((scorer, assist, kid))
+                for scorer, assist, kid in fm_results:
+                    if kid not in seen:
+                        scored.append((scorer, assist or "-", kid))
 
-                # ── Fuente 2: ESPN (fallback) ──────────────────────────────
+                # ── Fuente 2: Sofascore (fallback) ─────────────────────────
+                if not scored:
+                    sf_id = await loop.run_in_executor(
+                        _executor, find_sofascore_match_id,
+                        pg0.home_name, pg0.away_name,
+                    )
+                    if sf_id:
+                        sf_data = await loop.run_in_executor(
+                            _executor, sofascore_get,
+                            f"https://www.sofascore.com/api/v1/event/{sf_id}/incidents",
+                        )
+                        if sf_data:
+                            for inc in sf_data.get("incidents", []):
+                                if inc.get("incidentType") not in ("goal", "penalty"):
+                                    continue
+                                kid = f"sf_{sf_id}_{inc.get('time',0)}_{inc.get('player',{}).get('id','')}"
+                                if kid in seen:
+                                    continue
+                                scorer = inc.get("player", {}).get("name", "") or "-"
+                                assist = (inc.get("assist1") or {}).get("name", "") or "-"
+                                scored.append((scorer, assist, kid))
+
+                # ── Fuente 3: ESPN (último recurso) ────────────────────────
                 if not scored:
                     summary = await fetch_summary(pg0.league_slug, fid)
                     if summary:
