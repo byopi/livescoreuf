@@ -171,52 +171,118 @@ def _search_thesportsdb(team_name: str) -> Optional[Image.Image]:
     return None
 
 
+# Nombres alternativos para buscar si el nombre ESPN no da resultado
+_LOGO_ALIASES: dict[str, list[str]] = {
+    "FC Barcelona":             ["Barcelona", "Barca"],
+    "Barcelona":                ["FC Barcelona", "Barca"],
+    "Atletico Madrid":          ["Atlético Madrid", "Atletico de Madrid"],
+    "Olympique Lyonnais":       ["Lyon", "OL"],
+    "Olympique de Marseille":   ["Marseille", "OM"],
+    "Paris Saint-Germain":      ["PSG", "Paris SG"],
+    "Internazionale":           ["Inter Milan", "Inter", "FC Internazionale"],
+    "AC Milan":                 ["Milan"],
+    "Borussia Monchengladbach": ["M'gladbach", "Gladbach"],
+    "Wolverhampton Wanderers":  ["Wolves"],
+    "Wolves":                   ["Wolverhampton Wanderers"],
+    "Brighton":                 ["Brighton & Hove Albion"],
+    "West Ham":                 ["West Ham United"],
+    "Newcastle United":         ["Newcastle"],
+    "Tottenham Hotspur":        ["Tottenham", "Spurs"],
+    "Manchester United":        ["Man United", "Man Utd"],
+    "Manchester City":          ["Man City"],
+    "Leicester City":           ["Leicester"],
+    "Nottingham Forest":        ["Forest"],
+    "Real Betis":               ["Betis"],
+    "Athletic Club":            ["Athletic Bilbao"],
+    "Red Bull Salzburg":        ["Salzburg", "RB Salzburg"],
+    "Copenhagen":               ["FC Copenhagen", "FC Kobenhavn"],
+    "Sporting CP":              ["Sporting Lisboa", "Sporting"],
+    "United States":            ["USA", "USMNT"],
+    "Republic of Ireland":      ["Ireland"],
+    "Ivory Coast":              ["Cote d'Ivoire"],
+    "South Korea":              ["Korea Republic"],
+    "DR Congo":                 ["Congo DR"],
+}
+
+
+def _sanitize(name: str) -> str:
+    for ch in ["/", chr(92), ":", "*", "?", chr(34), "<", ">", "|"]:
+        name = name.replace(ch, "-")
+    return name.strip()
+
+
+def _try_local(name: str) -> Optional[Image.Image]:
+    """Intenta cargar el logo desde assets/logos/<name>.png"""
+    path = LOGOS_DIR / f"{_sanitize(name)}.png"
+    if path.exists():
+        try:
+            img = Image.open(str(path)).convert("RGBA")
+            return img.resize((210, 210), Image.LANCZOS)
+        except Exception:
+            pass
+    return None
+
+
 def _get_logo(team_name: str, espn_url: str = "") -> Optional[Image.Image]:
     """
     Obtiene el logo del equipo. Orden de prioridad:
-      1. Cache en memoria (esta sesión)
-      2. Archivo local  assets/logos/<team>.png
-      3. ESPN CDN       (URL directa del scoreboard)
-      4. api-sports.io  CDN público por ID (guarda el ID en logo_ids.json)
-      5. TheSportsDB    (último recurso)
+      1. Cache RAM
+      2. Archivo local con nombre ESPN exacto
+      3. Archivo local con aliases conocidos
+      4. ESPN CDN (URL del scoreboard)
+      5. api-sports.io por ID
+      6. TheSportsDB con aliases
     """
     # 1. Cache RAM
     if team_name in _logo_cache:
-        return _logo_cache[team_name]   # puede ser None si ya falló todo
+        return _logo_cache[team_name]
 
     img = None
 
-    # 2. Archivo local pre-descargado
-    _safe_name = team_name
-    for _ch in ["/", chr(92), ":", "*", "?", chr(34), "<", ">", "|"]:
-        _safe_name = _safe_name.replace(_ch, "-")
-    local_path = LOGOS_DIR / f"{_safe_name}.png"
-    if local_path.exists():
-        try:
-            img = Image.open(str(local_path)).convert("RGBA")
-            img = img.resize((210, 210), Image.LANCZOS)
-            logger.info("Logo local OK: %s", team_name)
-        except Exception:
-            img = None
+    # 2. Archivo local — nombre exacto ESPN
+    img = _try_local(team_name)
+    if img:
+        logger.info("Logo local OK: %s", team_name)
 
-    # 3. ESPN CDN (viene gratis con el scoreboard)
+    # 3. Archivo local — aliases
+    if not img:
+        for alias in _LOGO_ALIASES.get(team_name, []):
+            img = _try_local(alias)
+            if img:
+                logger.info("Logo local OK (alias %s): %s", alias, team_name)
+                break
+
+    # 4. ESPN CDN
     if not img and espn_url:
         img = _img_from_url(espn_url)
         if img:
             logger.info("Logo ESPN CDN OK: %s", team_name)
 
-    # 4. api-sports.io (busca + guarda ID para la próxima)
+    # 5. api-sports.io por ID conocido o búsqueda
     if not img:
         img = _search_apisports(team_name)
+        # Si falla con el nombre ESPN, intentar con alias
+        if not img:
+            for alias in _LOGO_ALIASES.get(team_name, []):
+                img = _search_apisports(alias)
+                if img:
+                    logger.info("Logo api-sports OK (alias %s): %s", alias, team_name)
+                    break
 
-    # 5. TheSportsDB
+    # 6. TheSportsDB con nombre y aliases
     if not img:
         img = _search_thesportsdb(team_name)
+        if not img:
+            for alias in _LOGO_ALIASES.get(team_name, []):
+                img = _search_thesportsdb(alias)
+                if img:
+                    logger.info("Logo TheSportsDB OK (alias %s): %s", alias, team_name)
+                    break
 
     if not img:
         logger.warning("Sin logo para: %s", team_name)
 
-    _logo_cache[team_name] = img   # None si falló, para no reintentar en esta sesión
+    _logo_cache[team_name] = img
     return img
 
 
