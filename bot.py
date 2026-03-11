@@ -45,7 +45,7 @@ TZ = timezone(timedelta(hours=-4))   # UTC-4
 BOT_TOKEN        = os.environ["BOT_TOKEN"]
 ADMIN_ID         = int(os.environ["ADMIN_ID"])
 CHANNEL_ID       = os.getenv("CHANNEL_ID", "")
-POLL_INTERVAL    = int(os.getenv("POLL_INTERVAL",    "60"))
+POLL_INTERVAL    = int(os.getenv("POLL_INTERVAL",    "15"))
 RESOLVE_INTERVAL = int(os.getenv("RESOLVE_INTERVAL", "15"))
 RESOLVE_TIMEOUT  = int(os.getenv("RESOLVE_TIMEOUT",  "180"))
 LINEUP_INTERVAL  = int(os.getenv("LINEUP_INTERVAL",  "120"))
@@ -476,16 +476,115 @@ def msg_lineup(league: str, home: str, away: str,
 # LOOPS DE BACKGROUND
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Set de partidos con tarea de resolución ya lanzada
+_resolving: set[str] = set()
+
+
+async def _resolve_goal(app: Application, pg: PendingGoal):
+    """
+    Tarea independiente por cada gol: hace polling a FotMob cada 3s
+    hasta obtener el goleador real, luego edita el mensaje.
+    Máximo RESOLVE_TIMEOUT segundos en total.
+    """
+    loop      = asyncio.get_running_loop()
+    seen      = resolved_kev.setdefault(pg.fixture_id, set())
+    elapsed   = 0
+    interval  = 3   # segundos entre intentos
+
+    logger.info("Resolviendo gol: %s vs %s minuto %s",
+                pg.home_name, pg.away_name, pg.elapsed)
+
+    while elapsed < RESOLVE_TIMEOUT and not pg.resolved:
+        await asyncio.sleep(interval)
+        elapsed += interval
+
+        try:
+            # ── FotMob (fuente primaria, la más rápida) ──────────────────
+            fm = await loop.run_in_executor(
+                _executor, get_scorer_assist,
+                pg.home_name, pg.away_name, None,
+            )
+            for scorer, assist, kid in fm:
+                if kid in seen or not scorer or scorer == "-":
+                    continue
+                seen.add(kid)
+                pg.scorer   = scorer
+                pg.assist   = assist or ""
+                pg.resolved = True
+                break
+
+            # ── Sofascore (si FotMob no dio nada aún) ───────────────────
+            if not pg.resolved:
+                sf_id = await loop.run_in_executor(
+                    _executor, find_sofascore_match_id,
+                    pg.home_name, pg.away_name,
+                )
+                if sf_id:
+                    sf_data = await loop.run_in_executor(
+                        _executor, sofascore_get,
+                        f"https://www.sofascore.com/api/v1/event/{sf_id}/incidents",
+                    )
+                    if sf_data:
+                        for inc in sf_data.get("incidents", []):
+                            if inc.get("incidentType") not in ("goal", "penalty"):
+                                continue
+                            kid = f"sf_{sf_id}_{inc.get('time',0)}_{inc.get('player',{}).get('id','')}"
+                            if kid in seen:
+                                continue
+                            scorer = (inc.get("player") or {}).get("name", "")
+                            if not scorer:
+                                continue
+                            seen.add(kid)
+                            pg.scorer   = scorer
+                            pg.assist   = (inc.get("assist1") or {}).get("name", "") or ""
+                            pg.resolved = True
+                            break
+
+        except Exception as exc:
+            logger.debug("_resolve_goal error: %s", exc)
+
+        if pg.resolved:
+            break
+
+    # Editar solo si tenemos goleador real
+    if pg.resolved and pg.scorer and pg.scorer != "-":
+        text = msg_goal(
+            pg.home_name, pg.away_name,
+            pg.home_score, pg.away_score,
+            pg.league_name, pg.scorer, pg.assist,
+            pg.goal_side, pg.elapsed,
+        )
+        if pg.tg_message:
+            try:
+                await pg.tg_message.edit_text(
+                    text, parse_mode="Markdown",
+                    link_preview_options=_NO_PREVIEW,
+                )
+                logger.info("✅ Gol editado: %s asiste %s",
+                            pg.scorer, pg.assist or "-")
+            except BadRequest:
+                pass
+            except Exception as exc:
+                logger.error("Error editando gol: %s", exc)
+    else:
+        # Timeout sin goleador — dejar mensaje como está
+        pg.resolved = True
+        logger.warning("Timeout sin goleador: %s vs %s min %s",
+                       pg.home_name, pg.away_name, pg.elapsed)
+
+    _resolving.discard(pg.fixture_id + pg.elapsed)
+
+
 async def monitor_loop(app: Application):
-    logger.info("monitor_loop iniciado")
+    logger.info("monitor_loop iniciado (poll cada %ds)", POLL_INTERVAL)
+    loop = asyncio.get_running_loop()
     while True:
         await asyncio.sleep(POLL_INTERVAL)
         for fid, fix in list(tracked.items()):
             if fix.finished:
                 continue
             try:
-                loop = asyncio.get_running_loop()
-                # Buscar sofascore_id si aún no lo tenemos (se pospuso del callback)
+                # Buscar sofascore_id si aún no lo tenemos
                 if not fix._sofascore_id:
                     sf_id = await loop.run_in_executor(
                         _executor, find_sofascore_match_id,
@@ -493,52 +592,62 @@ async def monitor_loop(app: Application):
                     )
                     if sf_id:
                         fix._sofascore_id = str(sf_id)
-                        logger.info("Sofascore ID encontrado para %s vs %s: %s",
-                                    fix.home_name, fix.away_name, sf_id)
 
-                # Sofascore primero para estado en vivo; fallback a ESPN
-                sf_id = fix._sofascore_id or fid
-                raw = await loop.run_in_executor(_executor, get_event_by_id, sf_id)
-                if raw:
-                    raw["_slug"]   = fix.league_slug
-                    raw["_league"] = fix.league_name
-                else:
-                    # Fallback ESPN
+                # Obtener estado actual
+                raw = None
+                if fix._sofascore_id:
+                    raw = await loop.run_in_executor(
+                        _executor, get_event_by_id, fix._sofascore_id,
+                    )
+                    if raw:
+                        raw["_slug"]   = fix.league_slug
+                        raw["_league"] = fix.league_name
+
+                if not raw:
                     events = await fetch_scoreboard(fix.league_slug)
                     raw = next((e for e in events if e["id"] == fid), None)
                     if not raw:
                         continue
                     raw["_slug"]   = fix.league_slug
                     raw["_league"] = fix.league_name
-                p = parse_event(raw)
 
+                p      = parse_event(raw)
                 new_h  = p["home_score"]
                 new_a  = p["away_score"]
                 status = p["status_type"]
                 clock  = p["clock"]
 
-                # Gol detectado
+                # ── Gol detectado ──────────────────────────────────────────
                 if new_h != fix.home_score or new_a != fix.away_score:
-                    dh = new_h - fix.home_score
-                    da = new_a - fix.away_score
+                    dh   = new_h - fix.home_score
+                    da   = new_a - fix.away_score
                     side = "home" if dh > 0 and da == 0 else "away" if da > 0 and dh == 0 else ""
                     fix.home_score = new_h
                     fix.away_score = new_a
 
                     dest = CHANNEL_ID if CHANNEL_ID else ADMIN_ID
                     for _ in range(max(dh + da, 1)):
-                        text = msg_goal(fix.home_name, fix.away_name, new_h, new_a,
-                                        fix.league_name, "-", "-",
-                                        side, clock)
+                        text = msg_goal(fix.home_name, fix.away_name,
+                                        new_h, new_a, fix.league_name,
+                                        "-", "", side, clock)
                         try:
-                            sent = await app.bot.send_message(chat_id=dest, text=text, parse_mode="Markdown", disable_web_page_preview=True)
-                            pending_goals.append(PendingGoal(
+                            sent = await app.bot.send_message(
+                                chat_id=dest, text=text,
+                                parse_mode="Markdown",
+                                disable_web_page_preview=True,
+                            )
+                            pg = PendingGoal(
                                 fixture_id=fid, league_slug=fix.league_slug,
                                 home_name=fix.home_name, away_name=fix.away_name,
                                 home_score=new_h, away_score=new_a,
                                 league_name=fix.league_name, elapsed=clock,
                                 goal_side=side, tg_message=sent,
-                            ))
+                            )
+                            pending_goals.append(pg)
+                            # Lanzar resolución inmediata en paralelo
+                            asyncio.create_task(_resolve_goal(app, pg))
+                            logger.info("⚽ Gol detectado: %s %d-%d %s",
+                                        fix.home_name, new_h, new_a, fix.away_name)
                         except Exception as exc:
                             logger.error("Error enviando gol: %s", exc)
 
@@ -594,151 +703,6 @@ async def monitor_loop(app: Application):
             except Exception as exc:
                 logger.error("monitor_loop error en %s: %s", fid, exc)
 
-
-async def _fetch_scorer(home: str, away: str, league_slug: str,
-                        fid: str, seen: set, loop) -> list[tuple]:
-    """
-    Intenta obtener goleadores desde FotMob → Sofascore → ESPN.
-    Devuelve lista de (scorer, assist, kid) con datos reales (no "-").
-    """
-    scored = []
-
-    # ── FotMob ────────────────────────────────────────────────────────────────
-    fm_results = await loop.run_in_executor(
-        _executor, get_scorer_assist, home, away, None,
-    )
-    for scorer, assist, kid in fm_results:
-        if kid not in seen and scorer and scorer != "-":
-            scored.append((scorer, assist or "", kid))
-
-    # ── Sofascore ─────────────────────────────────────────────────────────────
-    if not scored:
-        sf_id = await loop.run_in_executor(
-            _executor, find_sofascore_match_id, home, away,
-        )
-        if sf_id:
-            sf_data = await loop.run_in_executor(
-                _executor, sofascore_get,
-                f"https://www.sofascore.com/api/v1/event/{sf_id}/incidents",
-            )
-            if sf_data:
-                for inc in sf_data.get("incidents", []):
-                    if inc.get("incidentType") not in ("goal", "penalty"):
-                        continue
-                    kid = f"sf_{sf_id}_{inc.get('time',0)}_{inc.get('player',{}).get('id','')}"
-                    if kid in seen:
-                        continue
-                    scorer = (inc.get("player") or {}).get("name", "")
-                    if not scorer:
-                        continue
-                    assist = (inc.get("assist1") or {}).get("name", "") or ""
-                    scored.append((scorer, assist, kid))
-
-    # ── ESPN ──────────────────────────────────────────────────────────────────
-    if not scored:
-        summary = await fetch_summary(league_slug, fid)
-        if summary:
-            for kev in parse_key_events(summary):
-                kid = str(kev.get("id", ""))
-                if kid in seen:
-                    continue
-                scorer, assist = parse_goal_event(kev)
-                if scorer and scorer != "-":
-                    scored.append((scorer, assist or "", kid))
-
-    return scored
-
-
-async def resolve_loop(app: Application):
-    """
-    Polling agresivo: cuando hay goles pendientes consulta cada 4s.
-    Solo edita el mensaje cuando tiene el goleador real (nunca edita con "-").
-    Si supera el timeout, simplemente deja el mensaje como está.
-    """
-    logger.info("resolve_loop iniciado")
-    FAST_INTERVAL = 4   # segundos entre intentos cuando hay gol pendiente
-    IDLE_INTERVAL = 10  # segundos cuando no hay nada pendiente
-
-    while True:
-        if not pending_goals:
-            await asyncio.sleep(IDLE_INTERVAL)
-            continue
-
-        # Agrupar por partido
-        by_fix: dict[str, list[PendingGoal]] = {}
-        for pg in pending_goals:
-            if not pg.resolved:
-                by_fix.setdefault(pg.fixture_id, []).append(pg)
-
-        if not by_fix:
-            await asyncio.sleep(IDLE_INTERVAL)
-            continue
-
-        loop = asyncio.get_running_loop()
-
-        for fid, goals in by_fix.items():
-            try:
-                unresolved = [g for g in goals if not g.resolved]
-                if not unresolved:
-                    continue
-
-                pg0  = goals[0]
-                seen = resolved_kev.setdefault(fid, set())
-
-                scored = await _fetch_scorer(
-                    pg0.home_name, pg0.away_name,
-                    pg0.league_slug, fid, seen, loop,
-                )
-
-                # ── Asignar a mensajes pendientes ──────────────────────────
-                for scorer, assist, kid in scored:
-                    if not unresolved:
-                        break
-                    pg = unresolved.pop(0)
-                    seen.add(kid)
-                    pg.scorer   = scorer
-                    pg.assist   = assist
-                    pg.resolved = True
-
-                    # Solo editar si tenemos goleador real
-                    text = msg_goal(
-                        pg.home_name, pg.away_name,
-                        pg.home_score, pg.away_score,
-                        pg.league_name, scorer, assist,
-                        pg.goal_side, pg.elapsed,
-                    )
-                    if pg.tg_message:
-                        try:
-                            await pg.tg_message.edit_text(
-                                text, parse_mode="Markdown",
-                                link_preview_options=_NO_PREVIEW,
-                            )
-                            logger.info("Gol editado: %s (%s)", scorer, pg.home_name)
-                        except BadRequest:
-                            pass
-                        except Exception as exc:
-                            logger.error("Error editando gol: %s", exc)
-
-                # ── Timeout: dejar el mensaje como está, solo marcar resuelto
-                for pg in goals:
-                    if not pg.resolved:
-                        pg.elapsed_secs += FAST_INTERVAL
-                        if pg.elapsed_secs >= RESOLVE_TIMEOUT:
-                            pg.resolved = True
-                            logger.warning(
-                                "Timeout sin goleador: %s vs %s, minuto %s",
-                                pg.home_name, pg.away_name, pg.elapsed,
-                            )
-                            # No se edita el mensaje — queda con "⚽ -"
-
-            except Exception as exc:
-                logger.error("resolve_loop error en %s: %s", fid, exc)
-
-        pending_goals[:] = [pg for pg in pending_goals if not pg.resolved]
-
-        # Dormir poco si siguen pendientes, más si ya no hay
-        remaining = sum(1 for pg in pending_goals if not pg.resolved)
-        await asyncio.sleep(FAST_INTERVAL if remaining else IDLE_INTERVAL)
 
 
 async def lineup_loop(app: Application):
@@ -1445,7 +1409,6 @@ async def cmd_preview(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def post_init(app: Application):
     app.create_task(monitor_loop(app))
-    app.create_task(resolve_loop(app))
     app.create_task(lineup_loop(app))
     logger.info("Loops iniciados.")
 
