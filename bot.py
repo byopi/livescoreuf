@@ -103,8 +103,23 @@ ESPN_LEAGUES = {
     "Mundial FIFA 2026":        "fifa.world",
 }
 
-ESPN_FINAL  = {"STATUS_FINAL", "STATUS_FULL_TIME"}
-ESPN_LIVE   = {"STATUS_IN_PROGRESS", "STATUS_HALFTIME"}
+ESPN_FINAL  = {
+    "STATUS_FINAL",
+    "STATUS_FULL_TIME",
+    "STATUS_FINAL_AET",          # Final en prórroga
+    "STATUS_FINAL_PEN",          # Final en penales
+    "STATUS_SHOOTOUT_FINAL",     # variante ESPN para penales
+}
+ESPN_LIVE   = {
+    "STATUS_IN_PROGRESS",
+    "STATUS_HALFTIME",
+    "STATUS_EXTRA_TIME",         # Prórroga en curso
+    "STATUS_PENALTY",            # Tanda de penales en curso
+    "STATUS_SHOOTOUT",           # variante ESPN para penales en curso
+}
+# Partidos que terminaron en penales o prórroga
+ESPN_PENALTIES = {"STATUS_FINAL_PEN", "STATUS_SHOOTOUT_FINAL"}
+ESPN_AET       = {"STATUS_FINAL_AET"}
 
 # Thread pool para requests HTTP (no bloquean el event loop)
 _executor = ThreadPoolExecutor(max_workers=16)
@@ -397,6 +412,49 @@ def parse_stats(summary: dict) -> tuple[dict, dict]:
     return home_s, away_s
 
 
+def parse_shootout(summary: dict) -> tuple[list[str], list[str]]:
+    """
+    Extrae la tanda de penales del summary de ESPN.
+    Devuelve (home_kicks, away_kicks) donde cada elemento es algo como
+    'Mbappé ✅' o 'Vinicius ❌'.
+    """
+    home_kicks: list[str] = []
+    away_kicks: list[str] = []
+
+    # ESPN puede poner los penales en keyEvents o en shootout
+    # Revisamos keyEvents con type "Shootout"
+    for ev in summary.get("keyEvents", []):
+        ev_type = (ev.get("type", {}).get("text") or "").lower()
+        if "shootout" not in ev_type and "penalty" not in ev_type:
+            continue
+        # Determinar si convirtió o no
+        text = (ev.get("shortText") or ev.get("text") or "").lower()
+        scored = "saved" not in text and "missed" not in text and "post" not in text
+        icon = "✅" if scored else "❌"
+
+        athletes = ev.get("athletes", [])
+        name = ""
+        for ath in athletes:
+            name = ath.get("displayName") or ath.get("fullName", "")
+            if name:
+                break
+        if not name:
+            raw = ev.get("shortText") or ev.get("text") or ""
+            m = re.match(r"^([\w\s.\-'áéíóúñÁÉÍÓÚÑ]+)", raw)
+            name = m.group(1).strip() if m else "?"
+
+        # Determinar equipo por teamId — ESPN pone homeAway en el competidor
+        team_id = ev.get("team", {}).get("id", "")
+        comps = (summary.get("header", {}).get("competitions") or [{}])[0].get("competitors", [])
+        home_id = comps[0].get("id", "") if comps else ""
+        if team_id == home_id:
+            home_kicks.append(f"{name} {icon}")
+        else:
+            away_kicks.append(f"{name} {icon}")
+
+    return home_kicks, away_kicks
+
+
 def build_raw_stats_from_espn(summary: dict) -> list[dict]:
     """Convierte las stats de ESPN al formato raw_stats de image_generator."""
     home_s, away_s = parse_stats(summary)
@@ -456,6 +514,52 @@ def msg_final(home: str, away: str, hs: int, as_: int) -> str:
     ])
 
 
+def msg_final_aet(home: str, away: str, hs: int, as_: int) -> str:
+    return "\n".join([
+        "*📢 | FINAL — PRÓRROGA*",
+        "",
+        f"↪️ {home} {hs}-{as_} {away} *(a.e.t.)*",
+        "",
+        "*🎦 Todos los videos de los goles disponibles aqui: t.me/ufgoals*",
+        "",
+        "_⚽ Suscribete en t.me/iUniversoFootball_",
+    ])
+
+
+def msg_final_pen(
+    home: str, away: str,
+    hs: int, as_: int,
+    pen_h: int, pen_a: int,
+    home_kicks: list[str], away_kicks: list[str],
+) -> str:
+    lines = [
+        "*📢 | FINAL — PENALES*",
+        "",
+        f"↪️ {home} {hs}-{as_} {away} *(90')*",
+        f"🥅 Penales: *{home} {pen_h}-{pen_a} {away}*",
+    ]
+    if home_kicks or away_kicks:
+        lines.append("")
+        # Poner ambas columnas en paralelo
+        max_len = max(len(home_kicks), len(away_kicks))
+        for i in range(max_len):
+            hk = home_kicks[i] if i < len(home_kicks) else ""
+            ak = away_kicks[i] if i < len(away_kicks) else ""
+            if hk and ak:
+                lines.append(f"  {hk}   |   {ak}")
+            elif hk:
+                lines.append(f"  {hk}")
+            elif ak:
+                lines.append(f"  {'':20}|   {ak}")
+    lines += [
+        "",
+        "*🎦 Todos los videos de los goles disponibles aqui: t.me/ufgoals*",
+        "",
+        "_⚽ Suscribete en t.me/iUniversoFootball_",
+    ]
+    return "\n".join(lines)
+
+
 def msg_lineup(league: str, home: str, away: str,
                home_xi: list[str], away_xi: list[str]) -> str:
     tag  = league.replace(" ", "")
@@ -495,9 +599,6 @@ async def _resolve_goal(app: Application, pg: PendingGoal):
                 pg.home_name, pg.away_name, pg.elapsed)
 
     while elapsed < RESOLVE_TIMEOUT and not pg.resolved:
-        await asyncio.sleep(interval)
-        elapsed += interval
-
         try:
             # ── FotMob (fuente primaria, la más rápida) ──────────────────
             fm = await loop.run_in_executor(
@@ -505,7 +606,9 @@ async def _resolve_goal(app: Application, pg: PendingGoal):
                 pg.home_name, pg.away_name, None,
             )
             for scorer, assist, kid in fm:
-                if kid in seen or not scorer or scorer == "-":
+                if not scorer or scorer == "-":
+                    continue          # scorer vacío → no marcar como visto, reintentar
+                if kid in seen:
                     continue
                 seen.add(kid)
                 pg.scorer   = scorer
@@ -545,6 +648,8 @@ async def _resolve_goal(app: Application, pg: PendingGoal):
 
         if pg.resolved:
             break
+        await asyncio.sleep(interval)
+        elapsed += interval
 
     # Editar solo si tenemos goleador real
     if pg.resolved and pg.scorer and pg.scorer != "-":
@@ -651,7 +756,7 @@ async def monitor_loop(app: Application):
                         except Exception as exc:
                             logger.error("Error enviando gol: %s", exc)
 
-                # Final
+                # Final (incluye prórroga y penales)
                 if status in ESPN_FINAL and not fix.finished:
                     fix.finished = True
                     summary = await fetch_summary(fix.league_slug, fid)
@@ -687,7 +792,56 @@ async def monitor_loop(app: Application):
                         except Exception as exc:
                             logger.error("Error generando imagen: %s", exc)
 
-                    text = msg_final(fix.home_name, fix.away_name, fix.home_score, fix.away_score)
+                    # Construir texto según tipo de final
+                    if status in ESPN_PENALTIES:
+                        # Leer marcador de penales y detalle de la tanda
+                        pen_h = pen_a = 0
+                        home_kicks: list[str] = []
+                        away_kicks: list[str] = []
+                        if summary:
+                            try:
+                                # ESPN expone el marcador de penales en shootout o competitions
+                                comp0 = (summary.get("header", {})
+                                         .get("competitions") or [{}])[0]
+                                for competitor in comp0.get("competitors", []):
+                                    is_home = competitor.get("homeAway") == "home"
+                                    pen_score = int(
+                                        competitor.get("shootoutScore", 0) or 0
+                                    )
+                                    if is_home:
+                                        pen_h = pen_score
+                                    else:
+                                        pen_a = pen_score
+                                home_kicks, away_kicks = parse_shootout(summary)
+                            except Exception as exc:
+                                logger.warning("Error leyendo tanda de penales: %s", exc)
+                        text = msg_final_pen(
+                            fix.home_name, fix.away_name,
+                            fix.home_score, fix.away_score,
+                            pen_h, pen_a,
+                            home_kicks, away_kicks,
+                        )
+                        logger.info(
+                            "🥅 Final en penales: %s %d(%d)-%d(%d) %s",
+                            fix.home_name, fix.home_score, pen_h,
+                            fix.away_score, pen_a, fix.away_name,
+                        )
+                    elif status in ESPN_AET:
+                        text = msg_final_aet(
+                            fix.home_name, fix.away_name,
+                            fix.home_score, fix.away_score,
+                        )
+                        logger.info(
+                            "⏱️ Final en prórroga: %s %d-%d %s",
+                            fix.home_name, fix.home_score,
+                            fix.away_score, fix.away_name,
+                        )
+                    else:
+                        text = msg_final(
+                            fix.home_name, fix.away_name,
+                            fix.home_score, fix.away_score,
+                        )
+
                     dest = CHANNEL_ID if CHANNEL_ID else ADMIN_ID
                     try:
                         if img_path and os.path.exists(img_path):
