@@ -2,14 +2,7 @@
 espn_goals.py
 =============
 Obtiene goleadores en tiempo real desde ESPN buscando por nombre de equipo.
-No requiere API key. Funciona siempre que ESPN tenga el partido cubierto.
-
-Uso:
-    from espn_goals import get_espn_scorer
-
-    results = get_espn_scorer("Fiorentina", "Rakow Czestochowa")
-    for scorer, assist, kid in results:
-        print(scorer, assist, kid)
+No requiere API key ni autenticacion.
 """
 
 import re
@@ -26,7 +19,6 @@ _HEADERS = {
     "Accept": "application/json",
 }
 
-# Slugs en orden de probabilidad (ligas donde más partidos hay)
 _SLUGS = [
     "uefa.champions", "uefa.europa", "uefa.europa.conf",
     "esp.1", "eng.1", "ger.1", "ita.1", "fra.1",
@@ -44,7 +36,11 @@ _match_cache: dict[str, tuple[str, str]] = {}
 
 def _norm(text: str) -> str:
     text = text.lower()
-    for k, v in {"á":"a","é":"e","í":"i","ó":"o","ú":"u","ü":"u","ñ":"n","ć":"c","ą":"a","ę":"e","ó":"o","ź":"z","ż":"z","ł":"l"}.items():
+    for k, v in {
+        "á":"a","é":"e","í":"i","ó":"o","ú":"u","ü":"u","ñ":"n",
+        "ć":"c","ą":"a","ę":"e","ź":"z","ż":"z","ł":"l","š":"s",
+        "č":"c","ž":"z","ř":"r","ů":"u","ď":"d","ť":"t","ň":"n",
+    }.items():
         text = text.replace(k, v)
     return re.sub(r"[^a-z0-9 ]", "", text).strip()
 
@@ -61,10 +57,6 @@ def _get(url: str, params: dict = None) -> Optional[dict]:
 
 
 def _find_espn_event(home_name: str, away_name: str) -> tuple[Optional[str], str]:
-    """
-    Busca el evento ESPN por nombre de equipo en todos los slugs.
-    Devuelve (event_id, slug) o (None, "").
-    """
     cache_key = f"{home_name}|{away_name}"
     if cache_key in _match_cache:
         return _match_cache[cache_key]
@@ -82,7 +74,6 @@ def _find_espn_event(home_name: str, away_name: str) -> tuple[Optional[str], str
             a = next((c for c in comps if c.get("homeAway") == "away"), {})
             h_name = _norm(h.get("team", {}).get("displayName", ""))
             a_name = _norm(a.get("team", {}).get("displayName", ""))
-            # Match flexible: uno contiene al otro
             if ((home_q in h_name or h_name in home_q) and
                     (away_q in a_name or a_name in away_q)):
                 event_id = ev["id"]
@@ -91,29 +82,48 @@ def _find_espn_event(home_name: str, away_name: str) -> tuple[Optional[str], str
                             event_id, slug, h_name, a_name)
                 return event_id, slug
 
-    logger.warning("ESPN: no encontrado %s vs %s", home_name, away_name)
+    logger.warning("ESPN: no encontrado '%s' vs '%s'", home_name, away_name)
     return None, ""
 
 
+def _is_goal_event(ev: dict) -> bool:
+    """Detecta si un keyEvent es un gol, independiente de mayusculas/formato."""
+    type_text = (ev.get("type", {}).get("text") or "").lower()
+    type_id   = str(ev.get("type", {}).get("id") or "")
+    short     = (ev.get("shortText") or "").lower()
+    text      = (ev.get("text") or "").lower()
+
+    if "goal" in type_text:
+        return True
+    # IDs conocidos de gol en ESPN: 95=goal, 96=own goal, 98=penalty goal
+    if type_id in ("95", "96", "98", "99"):
+        return True
+    # Texto del evento contiene marcador tipo "1-0", "2-1"
+    if re.search(r"\b\d+[-]\d+\b", short) or re.search(r"\b\d+[-]\d+\b", text):
+        return True
+    return False
+
+
 def _parse_goal_event(ev: dict) -> tuple[str, str]:
-    """Extrae scorer y assist de un keyEvent de ESPN."""
     scorer = assist = ""
 
     for ath in ev.get("athletes", []):
         role = (ath.get("type") or "").lower()
         name = ath.get("displayName") or ath.get("fullName", "")
-        if role in ("scorer", "goal", "goalscorer") and name:
+        if role in ("scorer", "goal", "goalscorer", "athlete") and name and not scorer:
             scorer = name
         elif role in ("assist", "assister") and name:
             assist = name
 
-    # Fallback: leer del texto del evento
     raw = ev.get("shortText") or ev.get("text", "")
     if not scorer and raw:
         if re.search(r"own goal|autogol|en propia", raw, re.I):
             scorer = "Autogol"
         else:
-            m = re.match(r"^([\w\s.\-'áéíóúñÁÉÍÓÚÑćąęóźżł]+?)\s+\d+[''']", raw)
+            m = re.match(
+                r"^([\w\s.\-'áéíóúñÁÉÍÓÚÑćąęóźżłšč]+?)\s*[\(\d]",
+                raw
+            )
             if m:
                 scorer = m.group(1).strip()
 
@@ -128,8 +138,6 @@ def get_espn_scorer(
     """
     Devuelve lista de (scorer, assist, kid) para todos los goles
     que ESPN tenga registrados en el partido.
-
-    'seen' es un set opcional de kids ya procesados (para deduplicar).
     """
     if seen is None:
         seen = set()
@@ -140,20 +148,39 @@ def get_espn_scorer(
 
     summary = _get(_BASE_SUMMARY.format(slug=slug), params={"event": event_id})
     if not summary:
-        logger.debug("ESPN summary None para event_id=%s", event_id)
+        logger.warning("ESPN summary None para event_id=%s slug=%s", event_id, slug)
         return []
 
-    key_events = [
-        ev for ev in summary.get("keyEvents", [])
-        if "goal" in (ev.get("type", {}).get("text") or "").lower()
-    ]
-    logger.debug("ESPN keyEvents para %s vs %s: %d eventos",
-                 home_name, away_name, len(key_events))
+    all_key_events = summary.get("keyEvents", [])
+
+    # Log raw completo para diagnostico
+    logger.info(
+        "ESPN keyEvents raw [%s vs %s] (%d eventos): %s",
+        home_name, away_name, len(all_key_events),
+        [
+            {
+                "type": ev.get("type", {}).get("text"),
+                "type_id": ev.get("type", {}).get("id"),
+                "shortText": ev.get("shortText"),
+                "athletes": [
+                    {"role": a.get("type"), "name": a.get("displayName")}
+                    for a in ev.get("athletes", [])
+                ],
+            }
+            for ev in all_key_events
+        ]
+    )
+
+    key_events = [ev for ev in all_key_events if _is_goal_event(ev)]
+    logger.info("ESPN goles filtrados: %d de %d keyEvents para %s vs %s",
+                len(key_events), len(all_key_events), home_name, away_name)
 
     results = []
     for ev in key_events:
         scorer, assist = _parse_goal_event(ev)
         if not scorer:
+            logger.info("ESPN gol sin scorer parseado: shortText='%s'",
+                        ev.get("shortText") or ev.get("text"))
             continue
         clock = (ev.get("clock") or {}).get("displayValue", "?")
         kid   = f"espn_{event_id}_{clock}_{scorer}"
