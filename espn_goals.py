@@ -120,12 +120,14 @@ def _parse_goal_event(ev: dict) -> tuple[str, str]:
         if re.search(r"own goal|autogol|en propia", raw, re.I):
             scorer = "Autogol"
         else:
-            m = re.match(
-                r"^([\w\s.\-'áéíóúñÁÉÍÓÚÑćąęóźżłšč]+?)\s*[\(\d]",
-                raw
-            )
+            # Formato ESPN: "Nombre Apellido Goal - Tipo" o "Nombre 45'"
+            m = re.match(r"^(.+?)\s+Goal\b", raw, re.I)
             if m:
                 scorer = m.group(1).strip()
+            else:
+                m = re.match(r"^([\w\s.\-'áéíóúñÁÉÍÓÚÑćąęóźżłšč]+?)\s*[\(\d]", raw)
+                if m:
+                    scorer = m.group(1).strip()
 
     return scorer or "", assist or ""
 
