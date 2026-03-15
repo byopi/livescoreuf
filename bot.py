@@ -228,6 +228,15 @@ def _fetch_all_today() -> list[dict]:
                 results.append(ev)
     return results
 
+for date_str in {str(today_utc), str(today_local)}:
+    try:
+        evs = get_events_by_date(date_str)
+        logger.info("Sofascore fecha %s: %d eventos", date_str, len(evs))
+        for ev in evs:
+            seen.add(ev["id"])
+            results.append(ev)
+    except Exception as exc:
+        logger.error("Sofascore error fecha %s: %s", date_str, exc)
 
 # ── Wrappers async ─────────────────────────────────────────────────────────────
 
