@@ -140,7 +140,7 @@ def get_events_today(tz_offset: int = -4) -> list[dict]:
         if not data:
             continue
         events = data.get("events") or []
-        logger.info("TheSportsDB %s: %d eventos de fútbol", date_str, len(events))
+        logger.info("Ligas encontradas: %s", [ev.get("strLeague") for ev in events])
 
         for ev in events:
             ev_id = str(ev.get("idEvent", ""))
