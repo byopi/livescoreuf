@@ -59,15 +59,23 @@ _STAT_MAP = {
 # ─── HTTP ──────────────────────────────────────────────────────────────────────
 
 def _get(url: str) -> dict | None:
+    import os
+    proxy_url = os.getenv("PROXY_URL")
+    proxies   = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+
     time.sleep(0.3)
     for attempt in range(3):
         try:
-            r = requests.get(url, headers=_HEADERS, timeout=10)
+            r = requests.get(url, headers=_HEADERS, timeout=10, proxies=proxies)
             if r.status_code == 200:
                 return r.json()
             if r.status_code == 429:
                 logger.warning("Sofascore rate limit, esperando 30s...")
                 time.sleep(30)
+            elif r.status_code == 403:
+                logger.warning("Sofascore 403 — proxy bloqueado o no configurado (PROXY_URL=%s)",
+                               "configurado" if proxy_url else "NO configurado")
+                return None
             elif r.status_code == 404:
                 return None
             else:
