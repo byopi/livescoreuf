@@ -184,20 +184,36 @@ def _fetch_summary(slug: str, event_id: str) -> Optional[dict]:
 
 def _fetch_all_today() -> list[dict]:
     """
-    Devuelve partidos del día usando ESPN como fuente principal.
-    Sofascore daba 403 desde Render, así que se eliminó como fuente de listado.
+    Devuelve partidos del día.
+    Fuente principal: TheSportsDB (gratis, sin auth, sin bloqueos).
+    Fallback: ESPN.
     """
-    today_utc   = datetime.now(timezone.utc).date()
-    today_local = datetime.now(TZ).date()
-    valid_dates = {today_local, today_utc}
-
-    # También incluir mañana UTC por si el partido empieza cerca de medianoche
-    import datetime as dt_mod
-    tomorrow_utc = (datetime.now(timezone.utc) + timedelta(hours=24)).date()
+    from thesportsdb import get_events_today
+    now_utc     = datetime.now(timezone.utc)
+    today_utc   = now_utc.date()
+    today_local = now_utc.astimezone(TZ).date()
+    valid_dates = {today_utc, today_local,
+                   (now_utc + timedelta(hours=24)).date()}
 
     results = []
     seen    = set()
 
+    # ── TheSportsDB (fuente principal) ─────────────────────────────────────
+    try:
+        tsdb_events = get_events_today(tz_offset=-4)
+        for ev in tsdb_events:
+            if ev["id"] in seen:
+                continue
+            seen.add(ev["id"])
+            results.append(ev)
+        if results:
+            logger.info("TheSportsDB: %d partidos hoy", len(results))
+            return results
+    except Exception as exc:
+        logger.warning("TheSportsDB error: %s", exc)
+
+    # ── ESPN fallback ──────────────────────────────────────────────────────
+    logger.warning("TheSportsDB sin datos, usando ESPN como fallback")
     for league_name, slug in ESPN_LEAGUES.items():
         try:
             for ev in _fetch_scoreboard(slug):
@@ -212,9 +228,9 @@ def _fetch_all_today() -> list[dict]:
                         d_local = ev_dt.astimezone(TZ).date()
                         include = (d_utc in valid_dates or d_local in valid_dates)
                     except Exception:
-                        include = True   # fecha no parseable → incluir por si acaso
+                        include = True
                 else:
-                    include = True       # sin fecha → incluir
+                    include = True
                 if include:
                     seen.add(ev["id"])
                     ev["_slug"]   = slug
@@ -223,7 +239,7 @@ def _fetch_all_today() -> list[dict]:
         except Exception as exc:
             logger.debug("ESPN fetch error %s: %s", slug, exc)
 
-    logger.info("ESPN: %d partidos hoy (%s)", len(results), today_utc)
+    logger.info("ESPN fallback: %d partidos hoy (%s)", len(results), today_utc)
     return results
 
 
