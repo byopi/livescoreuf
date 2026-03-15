@@ -22,75 +22,60 @@ _HEADERS = {
     "Accept": "application/json",
 }
 
-# Ligas que nos interesan (nombre normalizado -> nombre display)
-# TheSportsDB devuelve strLeague, filtramos solo estas
-_LEAGUES_WANTED = {
-    "serie a",
-    "coppa italia",
-    "la liga",
-    "laliga",
-    "copa del rey",
-    "ligue 1",
-    "coupe de france",
-    "bundesliga",
-    "dfb pokal",
-    "dfb-pokal",
-    "premier league",
-    "fa cup",
-    "efl cup",
-    "league cup",
-    "champions league",
-    "uefa champions league",
-    "europa league",
-    "uefa europa league",
-    "conference league",
-    "uefa europa conference league",
-    "copa libertadores",
-    "copa sudamericana",
-    "nations league",
-    "uefa nations league",
-    "copa america",
-    "copa américa",
-    "world cup",
-    "fifa world cup",
-    "club world cup",
-    "fifa club world cup",
-    "recopa sudamericana",
+# Palabras clave para filtrar ligas (se buscan dentro del nombre normalizado)
+_LEAGUE_KEYWORDS = [
+    "serie a", "coppa italia",
+    "la liga", "laliga", "copa del rey",
+    "ligue 1", "coupe de france",
+    "bundesliga", "dfb pokal", "dfb-pokal",
+    "premier league", "fa cup", "efl cup", "league cup",
+    "champions league", "europa league", "conference league",
+    "libertadores", "sudamericana", "recopa sudamericana",
+    "nations league", "copa america", "copa américa",
+    "world cup", "club world cup",
+]
+
+# Mapa: palabra clave encontrada -> slug ESPN
+_KEYWORD_TO_ESPN_SLUG = {
+    "serie a":            "ita.1",
+    "coppa italia":       "ita.coppa_italia",
+    "la liga":            "esp.1",
+    "laliga":             "esp.1",
+    "copa del rey":       "esp.copa_del_rey",
+    "ligue 1":            "fra.1",
+    "coupe de france":    "fra.coupe_de_france",
+    "bundesliga":         "ger.1",
+    "dfb pokal":          "ger.dfb_pokal",
+    "dfb-pokal":          "ger.dfb_pokal",
+    "premier league":     "eng.1",
+    "fa cup":             "eng.fa",
+    "efl cup":            "eng.league_cup",
+    "league cup":         "eng.league_cup",
+    "champions league":   "uefa.champions",
+    "europa league":      "uefa.europa",
+    "conference league":  "uefa.europa.conf",
+    "libertadores":       "conmebol.libertadores",
+    "sudamericana":       "conmebol.sudamericana",
+    "recopa sudamericana":"conmebol.recopa",
+    "nations league":     "uefa.nations",
+    "copa america":       "conmebol.america",
+    "copa américa":       "conmebol.america",
+    "club world cup":     "fifa.cwc",
+    "world cup":          "fifa.world",
 }
 
-# Mapa TheSportsDB strLeague -> slug ESPN (para el livescore)
-_LEAGUE_TO_ESPN_SLUG = {
-    "Serie A":                        "ita.1",
-    "Coppa Italia":                   "ita.coppa_italia",
-    "La Liga":                        "esp.1",
-    "LaLiga":                         "esp.1",
-    "Copa del Rey":                   "esp.copa_del_rey",
-    "Ligue 1":                        "fra.1",
-    "Coupe de France":                "fra.coupe_de_france",
-    "Bundesliga":                     "ger.1",
-    "DFB Pokal":                      "ger.dfb_pokal",
-    "DFB-Pokal":                      "ger.dfb_pokal",
-    "Premier League":                 "eng.1",
-    "FA Cup":                         "eng.fa",
-    "EFL Cup":                        "eng.league_cup",
-    "League Cup":                     "eng.league_cup",
-    "Champions League":               "uefa.champions",
-    "UEFA Champions League":          "uefa.champions",
-    "Europa League":                  "uefa.europa",
-    "UEFA Europa League":             "uefa.europa",
-    "Conference League":              "uefa.europa.conf",
-    "UEFA Europa Conference League":  "uefa.europa.conf",
-    "Copa Libertadores":              "conmebol.libertadores",
-    "Copa Sudamericana":              "conmebol.sudamericana",
-    "Nations League":                 "uefa.nations",
-    "UEFA Nations League":            "uefa.nations",
-    "Copa America":                   "conmebol.america",
-    "Copa América":                   "conmebol.america",
-    "FIFA Club World Cup":            "fifa.cwc",
-    "Club World Cup":                 "fifa.cwc",
-    "FIFA World Cup":                 "fifa.world",
-    "Recopa Sudamericana":            "conmebol.recopa",
-}
+
+def _match_league(league_name: str) -> tuple[bool, str]:
+    """
+    Devuelve (coincide, slug_espn) buscando palabras clave dentro del nombre.
+    Ej: "Italian Serie A" -> coincide con "serie a" -> "ita.1"
+    """
+    norm = _norm(league_name)
+    # Ordenar por longitud desc para que "club world cup" matchee antes que "world cup"
+    for kw in sorted(_KEYWORD_TO_ESPN_SLUG, key=len, reverse=True):
+        if kw in norm:
+            return True, _KEYWORD_TO_ESPN_SLUG[kw]
+    return False, ""
 
 
 def _get(url: str, params: dict = None) -> Optional[dict]:
@@ -140,7 +125,7 @@ def get_events_today(tz_offset: int = -4) -> list[dict]:
         if not data:
             continue
         events = data.get("events") or []
-        logger.info("Ligas encontradas: %s", [ev.get("strLeague") for ev in events])
+        logger.info("TheSportsDB %s: %d eventos de fútbol", date_str, len(events))
 
         for ev in events:
             ev_id = str(ev.get("idEvent", ""))
@@ -148,7 +133,8 @@ def get_events_today(tz_offset: int = -4) -> list[dict]:
                 continue
 
             league_name = ev.get("strLeague", "")
-            if _norm(league_name) not in _LEAGUES_WANTED:
+            matched, slug = _match_league(league_name)
+            if not matched:
                 continue
 
             seen.add(ev_id)
@@ -184,8 +170,7 @@ def get_events_today(tz_offset: int = -4) -> list[dict]:
 
             clock = status_raw if status_raw not in ("NS", "FT") else ""
 
-            # Slug ESPN
-            slug = _LEAGUE_TO_ESPN_SLUG.get(league_name, "")
+            # Slug ESPN ya viene de _match_league
 
             results.append({
                 "id":          ev_id,
