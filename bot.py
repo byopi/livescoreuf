@@ -173,8 +173,15 @@ def _espn_get(url: str, params: dict = None) -> Optional[dict]:
         return None
 
 
-def _fetch_scoreboard(slug: str) -> list[dict]:
-    data = _espn_get(ESPN_SCOREBOARD.format(league=slug))
+def _fetch_scoreboard(slug: str, date: str = None) -> list[dict]:
+    """
+    date: "YYYYMMDD" — si se pasa, ESPN filtra solo esa fecha.
+    Sin date ESPN devuelve la jornada más reciente (puede ser ayer).
+    """
+    params = {}
+    if date:
+        params["dates"] = date
+    data = _espn_get(ESPN_SCOREBOARD.format(league=slug), params=params or None)
     return data.get("events", []) if data else []
 
 
@@ -184,50 +191,29 @@ def _fetch_summary(slug: str, event_id: str) -> Optional[dict]:
 
 def _fetch_all_today() -> list[dict]:
     """
-    Devuelve partidos del día usando Sofascore como fuente principal.
-    ESPN se usa como fallback si Sofascore no responde (o da 403 sin proxy).
-    Configura PROXY_URL en las variables de entorno para que Sofascore funcione
-    desde servidores cloud como Render.
+    Devuelve partidos del día usando ESPN con el parámetro ?dates=YYYYMMDD
+    para forzar la fecha correcta (sin esto ESPN devuelve la jornada anterior).
     """
-    today_utc   = datetime.now(timezone.utc).date()
-    today_local = datetime.now(TZ).date()
-    valid_dates = {today_utc, today_local,
-                   (datetime.now(timezone.utc) + timedelta(hours=24)).date()}
+    now_utc     = datetime.now(timezone.utc)
+    today_utc   = now_utc.date()
+    today_local = now_utc.astimezone(TZ).date()
 
-    # ── Sofascore (fuente principal) ───────────────────────────────────────
+    # Fechas a consultar: hoy UTC, hoy local y mañana UTC (por partidos nocturnos)
+    dates_to_query = {
+        today_utc.strftime("%Y%m%d"),
+        today_local.strftime("%Y%m%d"),
+        (now_utc + timedelta(hours=24)).date().strftime("%Y%m%d"),
+    }
+
     results = []
     seen    = set()
-    for date_str in {str(today_utc), str(today_local)}:
-        for ev in get_events_by_date(date_str):
-            if ev["id"] in seen:
-                continue
-            seen.add(ev["id"])
-            results.append(ev)
 
-    if results:
-        logger.info("Sofascore: %d partidos hoy", len(results))
-        return results
-
-    # ── ESPN fallback ──────────────────────────────────────────────────────
-    logger.warning("Sofascore sin datos, usando ESPN como fallback")
     for league_name, slug in ESPN_LEAGUES.items():
         try:
-            for ev in _fetch_scoreboard(slug):
-                if ev["id"] in seen:
-                    continue
-                raw = ev.get("date", "")
-                include = False
-                if raw:
-                    try:
-                        ev_dt   = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-                        d_utc   = ev_dt.astimezone(timezone.utc).date()
-                        d_local = ev_dt.astimezone(TZ).date()
-                        include = (d_utc in valid_dates or d_local in valid_dates)
-                    except Exception:
-                        include = True
-                else:
-                    include = True
-                if include:
+            for date_str in dates_to_query:
+                for ev in _fetch_scoreboard(slug, date=date_str):
+                    if ev["id"] in seen:
+                        continue
                     seen.add(ev["id"])
                     ev["_slug"]   = slug
                     ev["_league"] = league_name
@@ -235,7 +221,7 @@ def _fetch_all_today() -> list[dict]:
         except Exception as exc:
             logger.debug("ESPN fetch error %s: %s", slug, exc)
 
-    logger.info("ESPN fallback: %d partidos hoy (%s)", len(results), today_utc)
+    logger.info("ESPN: %d partidos hoy (%s)", len(results), today_utc)
     return results
 
 
