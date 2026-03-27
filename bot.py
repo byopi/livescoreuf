@@ -571,28 +571,33 @@ async def monitor_loop(app: Application):
     logger.info("monitor_loop iniciado (poll cada %ds)", POLL_INTERVAL)
     loop = asyncio.get_running_loop()
     
-    # URL para el self-ping (Render)
+    # Configuración de Auto-Ping para Render
     port = os.getenv("PORT", "8000")
     health_url = f"http://localhost:{port}"
 
     while True:
         try:
-            # ─── BLOQUE DE INMORTALIDAD (RENDER) ───
-            # Mantenemos la red activa engañando al servidor para que no entre en sleep
+            # ─── SISTEMA DE INMORTALIDAD (SELF-PING) ───
+            # Engañamos a Render generando tráfico interno al server.py
+            # Esto evita que la instancia entre en "Sleep Mode"
             try:
+                # Usamos run_in_executor para no bloquear el loop con requests
                 await loop.run_in_executor(None, requests.get, health_url, {"timeout": 5})
-            except:
-                pass 
+                logger.debug("Self-ping exitoso a %s", health_url)
+            except Exception as e:
+                logger.debug("Error en self-ping: %s", e)
 
+            # Espera el intervalo de sondeo
             await asyncio.sleep(POLL_INTERVAL)
 
+            # ─── MONITOREO DE PARTIDOS ───
             for fid, fix in list(tracked.items()):
                 if fix.finished:
                     continue
                 
                 try:
                     raw = None
-                    # Intento con FotMob
+                    # 1. Intentar con FotMob (Prioridad)
                     try:
                         raw = await loop.run_in_executor(
                             _executor, get_fotmob_livescore,
@@ -604,7 +609,7 @@ async def monitor_loop(app: Application):
                     except Exception as exc:
                         logger.debug("FotMob livescore error: %s", exc)
 
-                    # Si FotMob falla, usamos ESPN
+                    # 2. Fallback a ESPN Scoreboard
                     if not raw:
                         events = await fetch_scoreboard(fix.league_slug)
                         raw = next((e for e in events if e["id"] == fid), None)
@@ -619,11 +624,12 @@ async def monitor_loop(app: Application):
                     status = p["status_type"]
                     clock  = p["clock"]
 
-                    # ─── DETECCIÓN DE GOLES ───
+                    # Detección de cambios de marcador
                     if new_h != fix.home_score or new_a != fix.away_score:
-                        dh   = new_h - fix.home_score
-                        da   = new_a - fix.away_score
+                        dh = new_h - fix.home_score
+                        da = new_a - fix.away_score
                         side = "home" if dh > 0 and da == 0 else "away" if da > 0 and dh == 0 else ""
+                        
                         fix.home_score = new_h
                         fix.away_score = new_a
 
@@ -650,7 +656,7 @@ async def monitor_loop(app: Application):
                             except Exception as exc:
                                 logger.error("Error enviando gol: %s", exc)
 
-                    # ─── FINAL DEL PARTIDO ───
+                    # Detección de Final del Partido
                     if status in ESPN_FINAL and not fix.finished:
                         fix.finished = True
                         summary = await fetch_summary(fix.league_slug, fid)
@@ -668,23 +674,16 @@ async def monitor_loop(app: Application):
                                     "goals": {"home": fix.home_score, "away": fix.away_score},
                                 }
                                 
-                                fm_id = await loop.run_in_executor(
-                                    _executor, find_fotmob_match_id,
-                                    fix.home_name, fix.away_name,
-                                )
-                                raw_stats = await loop.run_in_executor(
-                                    _executor, fotmob_raw_stats,
-                                    fix.home_name, fix.away_name, fm_id,
-                                )
+                                fm_id = await loop.run_in_executor(_executor, find_fotmob_match_id, fix.home_name, fix.away_name)
+                                raw_stats = await loop.run_in_executor(_executor, fotmob_raw_stats, fix.home_name, fix.away_name, fm_id)
+                                
                                 if raw_stats is None:
                                     raw_stats = build_raw_stats_from_espn(summary)
                                     
                                 from image_generator import generate_match_summary
-                                img_path = await loop.run_in_executor(
-                                    _executor, generate_match_summary, fd, raw_stats
-                                )
+                                img_path = await loop.run_in_executor(_executor, generate_match_summary, fd, raw_stats)
                             except Exception as exc:
-                                logger.error("Error generando imagen: %s", exc)
+                                logger.error("Error generando imagen final: %s", exc)
 
                         text = msg_final(fix.home_name, fix.away_name, fix.home_score, fix.away_score)
                         dest = CHANNEL_ID if CHANNEL_ID else ADMIN_ID
@@ -695,17 +694,18 @@ async def monitor_loop(app: Application):
                             else:
                                 await app.bot.send_message(chat_id=dest, text=text, parse_mode="Markdown", disable_web_page_preview=True)
                         except Exception as exc:
-                            logger.error("Error enviando final: %s", exc)
+                            logger.error("Error enviando mensaje final: %s", exc)
 
                         tracked.pop(fid, None)
 
                 except Exception as exc:
-                    logger.error("Error procesando partido %s: %s", fid, exc)
+                    logger.error("Error en proceso de fixture %s: %s", fid, exc)
 
         except Exception as global_exc:
-            # Si hay un error de internet o caída masiva, el loop NO muere.
-            logger.critical("ERROR CRÍTICO EN MONITOR_LOOP: %s. Reintentando en 20s...", global_exc)
-            await asyncio.sleep(20)
+            # ─── BLINDAJE TOTAL ───
+            # Si hay un error de red masivo, el loop no se rompe
+            logger.critical("FALLO GLOBAL EN MONITOR_LOOP: %s. Reintentando ciclo...", global_exc)
+            await asyncio.sleep(10)
 
 
 async def lineup_loop(app: Application):
