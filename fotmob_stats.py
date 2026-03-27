@@ -174,3 +174,209 @@ def get_scorer_assist(home_name: str, away_name: str,
 
     goals = get_goal_events(match_id)
     return [(g["scorer"], g["assist"], g["id"]) for g in goals]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LIVESCORE — Estado del partido en vivo desde FotMob
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Mapa estado FotMob → nombres usados en bot.py
+_FOTMOB_STATUS_MAP = {
+    "notstarted":  "STATUS_SCHEDULED",
+    "ongoing":     "STATUS_IN_PROGRESS",
+    "halftime":    "STATUS_HALFTIME",
+    "finished":    "STATUS_FULL_TIME",
+    "cancelled":   "STATUS_CANCELED",
+    "postponed":   "STATUS_POSTPONED",
+}
+
+
+def get_fotmob_livescore(home_name: str, away_name: str,
+                         match_id: int | None = None) -> dict | None:
+    """
+    Devuelve el estado actual del partido en formato compatible con parse_event()
+    de bot.py, o None si no se encuentra.
+
+    Campos devueltos:
+    {
+        "id":       str,
+        "_slug":    "",
+        "_league":  str,
+        "date":     str (ISO),
+        "competitions": [{
+            "competitors": [{homeAway, score, team}...],
+            "status": {type: {name, description}, displayClock}
+        }]
+    }
+    """
+    if match_id is None:
+        match_id = find_fotmob_match_id(home_name, away_name)
+    if match_id is None:
+        return None
+
+    data = _get(f"{_BASE}/matchDetails", params={"matchId": match_id})
+    if not data:
+        return None
+
+    general = data.get("general", {})
+    home_team = general.get("homeTeam", {})
+    away_team = general.get("awayTeam", {})
+
+    # Marcador
+    home_score = str(general.get("homeScore", {}).get("current", 0) or 0)
+    away_score = str(general.get("awayScore", {}).get("current", 0) or 0)
+
+    # Estado y minuto
+    status_raw = (general.get("status", {}).get("liveTime", {}).get("short") or
+                  general.get("matchStatusId") or "notstarted")
+    if isinstance(status_raw, int):
+        status_raw = str(status_raw)
+    status_raw = status_raw.lower()
+
+    # Minuto mostrado
+    clock = general.get("status", {}).get("liveTime", {}).get("long", "") or ""
+
+    # Mapear estado
+    if "halftime" in status_raw or status_raw == "ht":
+        status_mapped = "STATUS_HALFTIME"
+        clock = "HT"
+    elif "finished" in status_raw or "ft" in status_raw or status_raw == "fulltime":
+        status_mapped = "STATUS_FULL_TIME"
+        clock = ""
+    elif any(x in status_raw for x in ("ongoing", "live", "inprogress")):
+        status_mapped = "STATUS_IN_PROGRESS"
+    elif status_raw.isdigit():
+        status_mapped = "STATUS_IN_PROGRESS"
+        clock = status_raw + "'"
+    else:
+        status_mapped = _FOTMOB_STATUS_MAP.get(status_raw, "STATUS_SCHEDULED")
+
+    # Logos
+    home_logo = f"https://images.fotmob.com/image_resources/logo/teamlogo/{home_team.get('id', '')}.png"
+    away_logo = f"https://images.fotmob.com/image_resources/logo/teamlogo/{away_team.get('id', '')}.png"
+
+    league_name = general.get("leagueName", "")
+    match_start = general.get("matchTimeUTCDate", "")
+
+    return {
+        "id":          str(match_id),
+        "_slug":       "",
+        "_league":     league_name,
+        "date":        match_start,
+        "competitions": [{
+            "competitors": [
+                {
+                    "homeAway": "home",
+                    "score":    home_score,
+                    "team": {
+                        "displayName": home_team.get("name", home_name),
+                        "logo":        home_logo,
+                    },
+                },
+                {
+                    "homeAway": "away",
+                    "score":    away_score,
+                    "team": {
+                        "displayName": away_team.get("name", away_name),
+                        "logo":        away_logo,
+                    },
+                },
+            ],
+            "status": {
+                "type": {
+                    "name":        status_mapped,
+                    "description": status_raw,
+                },
+                "displayClock": clock,
+            },
+        }],
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STATS PARA IMAGEN FINAL — Mismo formato que sofascore_raw_stats()
+# ══════════════════════════════════════════════════════════════════════════════
+
+def fotmob_raw_stats(home_name: str, away_name: str,
+                     match_id: int | None = None) -> list[dict] | None:
+    """
+    Devuelve estadísticas del partido en el mismo formato que sofascore_raw_stats(),
+    listo para pasar a generate_match_summary(). Devuelve None si falla.
+
+    Formato:
+    [
+        {"statistics": [{"type": "Posesion", "value": 56.0}, ...]},  # home
+        {"statistics": [{"type": "Posesion", "value": 44.0}, ...]},  # away
+    ]
+    """
+    if match_id is None:
+        match_id = find_fotmob_match_id(home_name, away_name)
+    if match_id is None:
+        return None
+
+    data = _get(f"{_BASE}/matchDetails", params={"matchId": match_id})
+    if not data:
+        return None
+
+    # FotMob guarda las stats en content.stats.stats (lista de grupos)
+    stat_groups = (
+        data.get("content", {})
+            .get("stats", {})
+            .get("stats", [])
+    )
+    if not stat_groups:
+        return None
+
+    # Mapa de claves FotMob -> tipo que espera image_generator
+    STAT_MAP = {
+        "Ball possession":        "Posesion",
+        "Possession":             "Posesion",
+        "Expected goals (xG)":   "xG",
+        "xG":                    "xG",
+        "Total shots":            "Tiros totales",
+        "Shots":                  "Tiros totales",
+        "Shots on target":        "Tiros a puerta",
+        "Corner kicks":           "Corners",
+        "Corners":                "Corners",
+        "Yellow cards":           "Tarjetas amarillas",
+        "Red cards":              "Tarjetas rojas",
+        "Offsides":               "Fuera de juego",
+    }
+
+    home_s: dict[str, float] = {}
+    away_s: dict[str, float] = {}
+
+    def to_float(v) -> float:
+        if v is None:
+            return 0.0
+        try:
+            return float(str(v).replace("%", "").strip())
+        except (ValueError, TypeError):
+            return 0.0
+
+    for group in stat_groups:
+        for item in group.get("items", []):
+            title = item.get("title", "")
+            key = STAT_MAP.get(title)
+            if not key:
+                continue
+            stats = item.get("stats", [])
+            # stats es [home_value, away_value] o {"home": x, "away": y}
+            if isinstance(stats, list) and len(stats) >= 2:
+                home_s[key] = home_s.get(key, 0.0) + to_float(stats[0])
+                away_s[key] = away_s.get(key, 0.0) + to_float(stats[1])
+            elif isinstance(stats, dict):
+                home_s[key] = home_s.get(key, 0.0) + to_float(stats.get("home"))
+                away_s[key] = away_s.get(key, 0.0) + to_float(stats.get("away"))
+
+    if not home_s and not away_s:
+        logger.warning("FotMob: stats vacías para match_id=%s", match_id)
+        return None
+
+    def to_list(d: dict) -> list[dict]:
+        return [{"type": k, "value": v} for k, v in d.items()]
+
+    return [
+        {"statistics": to_list(home_s)},
+        {"statistics": to_list(away_s)},
+    ]

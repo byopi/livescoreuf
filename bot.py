@@ -13,13 +13,12 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import requests
-from sofascore_stats import (
-    sofascore_raw_stats, find_sofascore_match_id,
-    get_events_by_date, get_live_events, get_event_by_id,
-    _get as sofascore_get,
+from sofascore_stats import sofascore_raw_stats, _get as sofascore_get
+from fotmob_stats import (
+    get_scorer_assist, find_fotmob_match_id,
+    get_fotmob_livescore, fotmob_raw_stats,
 )
 from lineup_image_generator import generate_lineup_images
-from fotmob_stats import get_scorer_assist, find_fotmob_match_id
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from telegram.ext import (
     Application,
@@ -101,9 +100,6 @@ ESPN_LEAGUES = {
     "Clasificación CAF":        "caf.worldq",
     "Mundial de Clubes FIFA":   "fifa.cwc",
     "Mundial FIFA 2026":        "fifa.world",
-    # ── Amistosos ──────────────────────────────────────────────────────────
-    "Amistosos Internacionales": "fifa.friendly",
-    "Amistosos de Clubes":       "club.friendly",
 }
 
 ESPN_FINAL  = {"STATUS_FINAL", "STATUS_FULL_TIME"}
@@ -149,7 +145,7 @@ class TrackedFixture:
     finished:       bool = False
     lineup_sent:    bool = False
     lineup_tries:   int  = 0
-    _sofascore_id:  Optional[str] = None   # ID en Sofascore para livescore
+    _fotmob_id:     Optional[int] = None   # ID en FotMob para livescore
 
 
 # ─── Estado global ─────────────────────────────────────────────────────────────
@@ -496,72 +492,43 @@ async def _resolve_goal(app: Application, pg: PendingGoal):
 
     while elapsed < RESOLVE_TIMEOUT and not pg.resolved:
         try:
-            # ── 1. ESPN por nombre de equipo (principal) ──────────────────
-            from espn_goals import get_espn_scorer
-            results = await loop.run_in_executor(
-                _executor, get_espn_scorer,
-                pg.home_name, pg.away_name, seen,
-            )
-            for scorer, assist, kid in results:
-                seen.add(kid)
-                pg.scorer   = scorer
-                pg.assist   = assist or ""
-                pg.resolved = True
-                logger.info("ESPN resolvio: '%s' asiste '%s'", scorer, assist or "-")
-                break
+            # ── 1. FotMob (principal — más rápido) ───────────────────────
+            try:
+                fm = await loop.run_in_executor(
+                    _executor, get_scorer_assist,
+                    pg.home_name, pg.away_name, None,
+                )
+                for scorer, assist, kid in fm:
+                    if not scorer or scorer == "-":
+                        continue
+                    if kid in seen:
+                        continue
+                    seen.add(kid)
+                    pg.scorer   = scorer
+                    pg.assist   = assist or ""
+                    pg.resolved = True
+                    logger.info("FotMob resolvio: '%s' asiste '%s'", scorer, assist or "-")
+                    break
+            except Exception as exc:
+                logger.debug("FotMob error en resolver gol: %s", exc)
 
-            # ── 2. FotMob (fallback) ──────────────────────────────────────
+            # ── 2. ESPN por nombre de equipo (fallback) ───────────────────
             if not pg.resolved:
                 try:
-                    fm = await loop.run_in_executor(
-                        _executor, get_scorer_assist,
-                        pg.home_name, pg.away_name, None,
+                    from espn_goals import get_espn_scorer
+                    results = await loop.run_in_executor(
+                        _executor, get_espn_scorer,
+                        pg.home_name, pg.away_name, seen,
                     )
-                    for scorer, assist, kid in fm:
-                        if not scorer or scorer == "-":
-                            continue
-                        if kid in seen:
-                            continue
+                    for scorer, assist, kid in results:
                         seen.add(kid)
                         pg.scorer   = scorer
                         pg.assist   = assist or ""
                         pg.resolved = True
-                        logger.info("FotMob resolvio: '%s' asiste '%s'", scorer, assist or "-")
+                        logger.info("ESPN resolvio: '%s' asiste '%s'", scorer, assist or "-")
                         break
                 except Exception as exc:
-                    logger.debug("FotMob error: %s", exc)
-
-            # ── 3. Sofascore incidents (ultimo recurso) ───────────────────
-            if not pg.resolved:
-                try:
-                    sf_id = await loop.run_in_executor(
-                        _executor, find_sofascore_match_id,
-                        pg.home_name, pg.away_name,
-                    )
-                    if sf_id:
-                        sf_data = await loop.run_in_executor(
-                            _executor, sofascore_get,
-                            f"https://www.sofascore.com/api/v1/event/{sf_id}/incidents",
-                        )
-                        for inc in (sf_data or {}).get("incidents", []):
-                            if inc.get("incidentType") not in ("goal", "penalty"):
-                                continue
-                            pid = (inc.get("player") or {}).get("id", "")
-                            kid = f"sf_{sf_id}_{inc.get('time',0)}_{pid}"
-                            if kid in seen:
-                                continue
-                            scorer = (inc.get("player") or {}).get("name", "")
-                            if not scorer:
-                                continue
-                            seen.add(kid)
-                            pg.scorer   = scorer
-                            pg.assist   = (inc.get("assist1") or {}).get("name", "") or ""
-                            pg.resolved = True
-                            logger.info("Sofascore resolvio: '%s' asiste '%s'",
-                                        scorer, pg.assist or "-")
-                            break
-                except Exception as exc:
-                    logger.debug("Sofascore error: %s", exc)
+                    logger.debug("ESPN error en resolver gol: %s", exc)
 
         except Exception as exc:
             logger.warning("_resolve_goal error: %s", exc)
@@ -608,24 +575,19 @@ async def monitor_loop(app: Application):
             if fix.finished:
                 continue
             try:
-                # Buscar sofascore_id si aún no lo tenemos
-                if not fix._sofascore_id:
-                    sf_id = await loop.run_in_executor(
-                        _executor, find_sofascore_match_id,
-                        fix.home_name, fix.away_name,
-                    )
-                    if sf_id:
-                        fix._sofascore_id = str(sf_id)
-
-                # Obtener estado actual
+                # Obtener estado actual — FotMob primero, ESPN como fallback
                 raw = None
-                if fix._sofascore_id:
+                try:
                     raw = await loop.run_in_executor(
-                        _executor, get_event_by_id, fix._sofascore_id,
+                        _executor, get_fotmob_livescore,
+                        fix.home_name, fix.away_name, None,
                     )
                     if raw:
                         raw["_slug"]   = fix.league_slug
                         raw["_league"] = fix.league_name
+                        logger.debug("Livescore FotMob OK: %s vs %s", fix.home_name, fix.away_name)
+                except Exception as exc:
+                    logger.debug("FotMob livescore error: %s", exc)
 
                 if not raw:
                     events = await fetch_scoreboard(fix.league_slug)
@@ -634,6 +596,7 @@ async def monitor_loop(app: Application):
                         continue
                     raw["_slug"]   = fix.league_slug
                     raw["_league"] = fix.league_name
+                    logger.debug("Livescore ESPN fallback: %s vs %s", fix.home_name, fix.away_name)
 
                 p      = parse_event(raw)
                 new_h  = p["home_score"]
@@ -693,17 +656,21 @@ async def monitor_loop(app: Application):
                                 },
                                 "goals": {"home": fix.home_score, "away": fix.away_score},
                             }
-                            # Intentar Sofascore primero; fallback a ESPN
+                            # Stats: FotMob → ESPN fallback
                             loop = asyncio.get_running_loop()
-                            raw_stats = await loop.run_in_executor(
-                                _executor, sofascore_raw_stats,
-                                fix.home_name, fix.away_name, None,
+                            fm_id = await loop.run_in_executor(
+                                _executor, find_fotmob_match_id,
+                                fix.home_name, fix.away_name,
                             )
-                            if raw_stats is None:
-                                logger.info("Sofascore sin datos, usando ESPN para stats de imagen.")
-                                raw_stats = build_raw_stats_from_espn(summary)
+                            raw_stats = await loop.run_in_executor(
+                                _executor, fotmob_raw_stats,
+                                fix.home_name, fix.away_name, fm_id,
+                            )
+                            if raw_stats is not None:
+                                logger.info("Stats de imagen obtenidas desde FotMob.")
                             else:
-                                logger.info("Stats de imagen obtenidas desde Sofascore.")
+                                logger.info("FotMob sin stats, usando ESPN para imagen.")
+                                raw_stats = build_raw_stats_from_espn(summary)
                             from image_generator import generate_match_summary
                             img_path = await loop.run_in_executor(
                                 _executor, generate_match_summary, fd, raw_stats
