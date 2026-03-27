@@ -30,9 +30,6 @@ from telegram.ext import (
 from telegram.error import BadRequest
 from telegram import LinkPreviewOptions
 
-# Importamos tu módulo de TheSportsDB
-from thesportsdb import get_events_today
-
 _NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
 # ─── Logging ───────────────────────────────────────────────────────────────────
@@ -98,13 +95,14 @@ ESPN_LEAGUES = {
     "Eurocopa":                 "uefa.euro",
     "Copa América":             "conmebol.america",
     # ── Mundial 2026 (clasificatorias + torneo) ────────────────────────────
-    "Clasificación UEFA":       "uefa.worldq",
-    "Clasificación CONMEBOL":   "conmebol.worldq",
+    "Clasificación UEFA":       "fifa.uefa.worldq",
+    "Clasificación CONMEBOL":   "fifa.worldq.conmebol",
     "Clasificación CONCACAF":   "concacaf.worldq",
     "Clasificación AFC":        "afc.worldq",
     "Clasificación CAF":        "caf.worldq",
     "Mundial de Clubes FIFA":   "fifa.cwc",
     "Mundial FIFA 2026":        "fifa.world",
+    "Amistosos Internacionales":"fifa.friendly",
 }
 
 ESPN_FINAL  = {"STATUS_FINAL", "STATUS_FULL_TIME"}
@@ -189,50 +187,28 @@ def _fetch_summary(slug: str, event_id: str) -> Optional[dict]:
 
 
 def _fetch_all_today() -> list[dict]:
-    """
-    Combina ESPN y TheSportsDB para garantizar partidos, incluso en Fechas FIFA.
-    """
-    now_utc     = datetime.now(timezone.utc)
-    today_utc   = now_utc.date()
-    today_local = now_utc.astimezone(TZ).date()
-
-    dates_to_query = {
-        today_utc.strftime("%Y%m%d"),
-        today_local.strftime("%Y%m%d"),
-        (now_utc + timedelta(hours=24)).date().strftime("%Y%m%d"),
-    }
+    now_utc   = datetime.now(timezone.utc)
+    # Consultamos un rango de 3 días para capturar partidos por zona horaria
+    dates_to_query = [
+        (now_utc - timedelta(days=1)).strftime("%Y%m%d"),
+        now_utc.strftime("%Y%m%d"),
+        (now_utc + timedelta(days=1)).strftime("%Y%m%d"),
+    ]
 
     results = []
     seen    = set()
 
-    # 1. Intentar ESPN
     for league_name, slug in ESPN_LEAGUES.items():
-        try:
-            for date_str in dates_to_query:
-                for ev in _fetch_scoreboard(slug, date=date_str):
-                    if ev["id"] in seen:
-                        continue
+        for date_str in dates_to_query:
+            events = _fetch_scoreboard(slug, date=date_str)
+            for ev in events:
+                if ev["id"] not in seen:
                     seen.add(ev["id"])
                     ev["_slug"]   = slug
                     ev["_league"] = league_name
                     results.append(ev)
-        except Exception as exc:
-            logger.debug("ESPN fetch error %s: %s", slug, exc)
-
-    logger.info("ESPN reportó %d partidos para hoy (%s)", len(results), today_local)
-
-    # 2. Rescatar con TheSportsDB si ESPN no trajo nada o para complementar
-    try:
-        tsdb_events = get_events_today(tz_offset=-4)
-        for ev in tsdb_events:
-            ev_id = ev["id"]
-            if ev_id not in seen:
-                seen.add(ev_id)
-                results.append(ev)
-    except Exception as exc:
-        logger.warning("Error integrando TheSportsDB: %s", exc)
-
-    logger.info("Total final (ESPN + TSDB): %d partidos hoy.", len(results))
+    
+    logger.info(f"ESPN: {len(results)} partidos encontrados en total.")
     return results
 
 
@@ -258,31 +234,42 @@ async def fetch_summary(slug: str, event_id: str) -> Optional[dict]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def parse_event(ev: dict) -> dict:
-    # Soporte para data formateada de TheSportsDB
-    if ev.get("_tsdb"):
-        comp   = ev.get("competitions", [{}])[0]
-        comps  = comp.get("competitors", [])
-        home   = next((c for c in comps if c.get("homeAway") == "home"), {})
-        away   = next((c for c in comps if c.get("homeAway") == "away"), {})
-        status = comp.get("status", {})
+    comp   = ev.get("competitions", [{}])[0]
+    comps  = comp.get("competitors", [])
+    home   = next((c for c in comps if c.get("homeAway") == "home"), {})
+    away   = next((c for c in comps if c.get("homeAway") == "away"), {})
+    status = comp.get("status", {})
 
-        return {
-            "id":          ev["id"],
-            "home_name":   home.get("team", {}).get("displayName", "?"),
-            "away_name":   away.get("team", {}).get("displayName", "?"),
-            "home_score":  int(home.get("score", 0) or 0),
-            "away_score":  int(away.get("score", 0) or 0),
-            "home_logo":   home.get("team", {}).get("logo", ""),
-            "away_logo":   away.get("team", {}).get("logo", ""),
-            "status_type": status.get("type", {}).get("name", ""),
-            "status_desc": status.get("type", {}).get("description", ""),
-            "clock":       status.get("displayClock", ""),
-            "slug":        ev.get("_slug", ""),
-            "league":      ev.get("_league", ""),
-            "kickoff_utc": ev.get("kickoff_utc"),
-            "kickoff_str": ev.get("kickoff_utc").astimezone(TZ).strftime("%H:%M") if ev.get("kickoff_utc") else "--:--",
-        }
+    # Manejo SEGURO de fechas
+    raw_date = ev.get("date", "")
+    kickoff_utc = None
+    kickoff_str = "--:--"
+    
+    if raw_date:
+        try:
+            # Convertimos el string de ESPN a objeto datetime
+            kickoff_utc = datetime.fromisoformat(raw_date.replace("Z", "+00:00"))
+            kickoff_str = kickoff_utc.astimezone(TZ).strftime("%H:%M")
+        except Exception:
+            pass
 
+    return {
+        "id":          ev["id"],
+        "home_name":   home.get("team", {}).get("displayName", "?"),
+        "away_name":   away.get("team", {}).get("displayName", "?"),
+        "home_score":  int(home.get("score", 0) or 0),
+        "away_score":  int(away.get("score", 0) or 0),
+        "home_logo":   home.get("team", {}).get("logo", ""),
+        "away_logo":   away.get("team", {}).get("logo", ""),
+        "status_type": status.get("type", {}).get("name", ""),
+        "status_desc": status.get("type", {}).get("description", ""),
+        "clock":       status.get("displayClock", ""),
+        "slug":        ev.get("_slug", ""),
+        "league":      ev.get("_league", ""),
+        "kickoff_utc": kickoff_utc,
+        "kickoff_str": kickoff_str,
+    }
+    
     # ESPN normal
     comp   = ev.get("competitions", [{}])[0]
     comps  = comp.get("competitors", [])
