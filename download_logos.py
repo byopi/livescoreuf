@@ -92,6 +92,9 @@ LEAGUES = [
     ("Mundial 2026",            "fifa.world"),
     ("Mundial de Clubes",       "fifa.cwc"),
     ("Eliminatorias CONMEBOL",  "conmebol.worldq"),
+    # ── Amistosos ─────────────────────────────────────────────────────────────
+    ("Amistosos Internacionales", "fifa.friendly"),
+    ("Amistosos de Clubes",       "club.friendly"),
 ]
 
 # ──────────────────────────────────────────────────────────────────────────────
