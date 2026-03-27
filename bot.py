@@ -570,118 +570,142 @@ async def _resolve_goal(app: Application, pg: PendingGoal):
 async def monitor_loop(app: Application):
     logger.info("monitor_loop iniciado (poll cada %ds)", POLL_INTERVAL)
     loop = asyncio.get_running_loop()
+    
+    # URL para el self-ping (Render)
+    port = os.getenv("PORT", "8000")
+    health_url = f"http://localhost:{port}"
+
     while True:
-        await asyncio.sleep(POLL_INTERVAL)
-        for fid, fix in list(tracked.items()):
-            if fix.finished:
-                continue
+        try:
+            # ─── BLOQUE DE INMORTALIDAD (RENDER) ───
+            # Mantenemos la red activa engañando al servidor para que no entre en sleep
             try:
-                raw = None
+                await loop.run_in_executor(None, requests.get, health_url, {"timeout": 5})
+            except:
+                pass 
+
+            await asyncio.sleep(POLL_INTERVAL)
+
+            for fid, fix in list(tracked.items()):
+                if fix.finished:
+                    continue
+                
                 try:
-                    raw = await loop.run_in_executor(
-                        _executor, get_fotmob_livescore,
-                        fix.home_name, fix.away_name, None,
-                    )
-                    if raw:
+                    raw = None
+                    # Intento con FotMob
+                    try:
+                        raw = await loop.run_in_executor(
+                            _executor, get_fotmob_livescore,
+                            fix.home_name, fix.away_name, None,
+                        )
+                        if raw:
+                            raw["_slug"]   = fix.league_slug
+                            raw["_league"] = fix.league_name
+                    except Exception as exc:
+                        logger.debug("FotMob livescore error: %s", exc)
+
+                    # Si FotMob falla, usamos ESPN
+                    if not raw:
+                        events = await fetch_scoreboard(fix.league_slug)
+                        raw = next((e for e in events if e["id"] == fid), None)
+                        if not raw:
+                            continue
                         raw["_slug"]   = fix.league_slug
                         raw["_league"] = fix.league_name
-                except Exception as exc:
-                    logger.debug("FotMob livescore error: %s", exc)
 
-                if not raw:
-                    events = await fetch_scoreboard(fix.league_slug)
-                    raw = next((e for e in events if e["id"] == fid), None)
-                    if not raw:
-                        continue
-                    raw["_slug"]   = fix.league_slug
-                    raw["_league"] = fix.league_name
+                    p      = parse_event(raw)
+                    new_h  = p["home_score"]
+                    new_a  = p["away_score"]
+                    status = p["status_type"]
+                    clock  = p["clock"]
 
-                p      = parse_event(raw)
-                new_h  = p["home_score"]
-                new_a  = p["away_score"]
-                status = p["status_type"]
-                clock  = p["clock"]
+                    # ─── DETECCIÓN DE GOLES ───
+                    if new_h != fix.home_score or new_a != fix.away_score:
+                        dh   = new_h - fix.home_score
+                        da   = new_a - fix.away_score
+                        side = "home" if dh > 0 and da == 0 else "away" if da > 0 and dh == 0 else ""
+                        fix.home_score = new_h
+                        fix.away_score = new_a
 
-                if new_h != fix.home_score or new_a != fix.away_score:
-                    dh   = new_h - fix.home_score
-                    da   = new_a - fix.away_score
-                    side = "home" if dh > 0 and da == 0 else "away" if da > 0 and dh == 0 else ""
-                    fix.home_score = new_h
-                    fix.away_score = new_a
+                        dest = CHANNEL_ID if CHANNEL_ID else ADMIN_ID
+                        for _ in range(max(dh + da, 1)):
+                            text = msg_goal(fix.home_name, fix.away_name,
+                                            new_h, new_a, fix.league_name,
+                                            "-", "", side, clock)
+                            try:
+                                sent = await app.bot.send_message(
+                                    chat_id=dest, text=text,
+                                    parse_mode="Markdown",
+                                    disable_web_page_preview=True,
+                                )
+                                pg = PendingGoal(
+                                    fixture_id=fid, league_slug=fix.league_slug,
+                                    home_name=fix.home_name, away_name=fix.away_name,
+                                    home_score=new_h, away_score=new_a,
+                                    league_name=fix.league_name, elapsed=clock,
+                                    goal_side=side, tg_message=sent,
+                                )
+                                pending_goals.append(pg)
+                                asyncio.create_task(_resolve_goal(app, pg))
+                            except Exception as exc:
+                                logger.error("Error enviando gol: %s", exc)
 
-                    dest = CHANNEL_ID if CHANNEL_ID else ADMIN_ID
-                    for _ in range(max(dh + da, 1)):
-                        text = msg_goal(fix.home_name, fix.away_name,
-                                        new_h, new_a, fix.league_name,
-                                        "-", "", side, clock)
-                        try:
-                            sent = await app.bot.send_message(
-                                chat_id=dest, text=text,
-                                parse_mode="Markdown",
-                                disable_web_page_preview=True,
-                            )
-                            pg = PendingGoal(
-                                fixture_id=fid, league_slug=fix.league_slug,
-                                home_name=fix.home_name, away_name=fix.away_name,
-                                home_score=new_h, away_score=new_a,
-                                league_name=fix.league_name, elapsed=clock,
-                                goal_side=side, tg_message=sent,
-                            )
-                            pending_goals.append(pg)
-                            asyncio.create_task(_resolve_goal(app, pg))
-                        except Exception as exc:
-                            logger.error("Error enviando gol: %s", exc)
+                    # ─── FINAL DEL PARTIDO ───
+                    if status in ESPN_FINAL and not fix.finished:
+                        fix.finished = True
+                        summary = await fetch_summary(fix.league_slug, fid)
 
-                if status in ESPN_FINAL and not fix.finished:
-                    fix.finished = True
-                    summary = await fetch_summary(fix.league_slug, fid)
-
-                    img_path = None
-                    if summary:
-                        try:
-                            fd = {
-                                "fixture": {"id": fid},
-                                "league":  {"name": fix.league_name},
-                                "teams": {
-                                    "home": {"name": fix.home_name, "logo": p["home_logo"]},
-                                    "away": {"name": fix.away_name, "logo": p["away_logo"]},
-                                },
-                                "goals": {"home": fix.home_score, "away": fix.away_score},
-                            }
-                            loop = asyncio.get_running_loop()
-                            fm_id = await loop.run_in_executor(
-                                _executor, find_fotmob_match_id,
-                                fix.home_name, fix.away_name,
-                            )
-                            raw_stats = await loop.run_in_executor(
-                                _executor, fotmob_raw_stats,
-                                fix.home_name, fix.away_name, fm_id,
-                            )
-                            if raw_stats is None:
-                                raw_stats = build_raw_stats_from_espn(summary)
+                        img_path = None
+                        if summary:
+                            try:
+                                fd = {
+                                    "fixture": {"id": fid},
+                                    "league":  {"name": fix.league_name},
+                                    "teams": {
+                                        "home": {"name": fix.home_name, "logo": p["home_logo"]},
+                                        "away": {"name": fix.away_name, "logo": p["away_logo"]},
+                                    },
+                                    "goals": {"home": fix.home_score, "away": fix.away_score},
+                                }
                                 
-                            from image_generator import generate_match_summary
-                            img_path = await loop.run_in_executor(
-                                _executor, generate_match_summary, fd, raw_stats
-                            )
+                                fm_id = await loop.run_in_executor(
+                                    _executor, find_fotmob_match_id,
+                                    fix.home_name, fix.away_name,
+                                )
+                                raw_stats = await loop.run_in_executor(
+                                    _executor, fotmob_raw_stats,
+                                    fix.home_name, fix.away_name, fm_id,
+                                )
+                                if raw_stats is None:
+                                    raw_stats = build_raw_stats_from_espn(summary)
+                                    
+                                from image_generator import generate_match_summary
+                                img_path = await loop.run_in_executor(
+                                    _executor, generate_match_summary, fd, raw_stats
+                                )
+                            except Exception as exc:
+                                logger.error("Error generando imagen: %s", exc)
+
+                        text = msg_final(fix.home_name, fix.away_name, fix.home_score, fix.away_score)
+                        dest = CHANNEL_ID if CHANNEL_ID else ADMIN_ID
+                        try:
+                            if img_path and os.path.exists(img_path):
+                                with open(img_path, "rb") as f:
+                                    await app.bot.send_photo(chat_id=dest, photo=f, caption=text, parse_mode="Markdown")
+                            else:
+                                await app.bot.send_message(chat_id=dest, text=text, parse_mode="Markdown", disable_web_page_preview=True)
                         except Exception as exc:
-                            logger.error("Error generando imagen: %s", exc)
+                            logger.error("Error enviando final: %s", exc)
 
-                    text = msg_final(fix.home_name, fix.away_name, fix.home_score, fix.away_score)
-                    dest = CHANNEL_ID if CHANNEL_ID else ADMIN_ID
-                    try:
-                        if img_path and os.path.exists(img_path):
-                            with open(img_path, "rb") as f:
-                                await app.bot.send_photo(chat_id=dest, photo=f, caption=text, parse_mode="Markdown")
-                        else:
-                            await app.bot.send_message(chat_id=dest, text=text, parse_mode="Markdown", disable_web_page_preview=True)
-                    except Exception as exc:
-                        logger.error("Error enviando final: %s", exc)
+                        tracked.pop(fid, None)
 
-                    tracked.pop(fid, None)
+                except Exception as exc:
+                    logger.error("Error procesando partido %s: %s", fid, exc)
 
-            except Exception as exc:
-                logger.error("monitor_loop error en %s: %s", fid, exc)
+        except Exception as global_exc:
+            # Si hay un error de internet o caída masiva, el loop NO muere.
+            logger.critical("ERROR CRÍTICO EN MONITOR_LOOP: %s. Reintentando en 20s...", global_exc)
+            await asyncio.sleep(20)
 
 
 async def lineup_loop(app: Application):
@@ -1233,10 +1257,30 @@ async def cmd_preview(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def post_init(app: Application):
+    # Tus tareas actuales
     app.create_task(monitor_loop(app))
     app.create_task(lineup_loop(app))
-    logger.info("Loops de fondo iniciados.")
+    
+    # LA NUEVA TAREA DE SUPERVIVENCIA
+    app.create_task(self_ping_loop())
+    
+    logger.info("¡Sistema Inmortal de Universo Football activado!")
 
+async def self_ping_loop():
+    """Evita que Render suspenda la instancia por inactividad."""
+    port = os.getenv("PORT", "8000")
+    # Intentamos conectar a localhost o a la URL de Render si la tienes en variables
+    url = f"http://localhost:{port}"
+    while True:
+        try:
+            # Hacemos una petición interna al servidor de server.py
+            requests.get(url, timeout=5)
+            logger.debug("Self-ping: Bot manteniéndose despierto.")
+        except Exception as e:
+            logger.debug(f"Self-ping local: {e}")
+        
+        # Esperar 10 minutos (Render apaga a los 15 min de inactividad)
+        await asyncio.sleep(600)
 
 def main():
     app = (
