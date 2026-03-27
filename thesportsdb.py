@@ -32,8 +32,11 @@ def _match_league(name: str) -> (bool, str):
             return True, kw
     return False, ""
 
-def get_tsdb_today(date_str: str) -> list:
-    """ date_str: 'YYYY-MM-DD' """
+def get_events_today(tz_offset: int = -4) -> list:
+    """ Obtiene eventos de hoy usando el offset horario """
+    now = datetime.now(timezone.utc) + timedelta(hours=tz_offset)
+    date_str = now.strftime("%Y-%m-%d")
+    
     url = f"{_BASE}/eventsday.php"
     params = {"d": date_str, "s": "Soccer"}
     
