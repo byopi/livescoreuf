@@ -28,6 +28,7 @@ _SLUGS = [
     "uefa.nations", "conmebol.america",
     "conmebol.worldq", "uefa.worldq", "concacaf.worldq",
     "afc.worldq", "caf.worldq", "fifa.cwc", "fifa.world",
+    "fifa.friendly", "club.friendly",
 ]
 
 # Cache: "home|away" -> (espn_event_id, slug)
