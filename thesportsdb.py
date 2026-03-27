@@ -33,6 +33,15 @@ _LEAGUE_KEYWORDS = [
     "libertadores", "sudamericana", "recopa sudamericana",
     "nations league", "copa america", "copa américa",
     "world cup", "club world cup",
+    # ── Amistosos ──────────────────────────────────────────────────────────
+    "international friendly", "friendly international",
+    "international friendlies", "friendly match",
+    "amistoso internacional", "amistosos internacionales",
+    "club friendly", "club friendlies",
+    "international champions cup", "fifa series",
+    "audi cup", "emirates cup", "florida cup",
+    "preseason friendly", "pre-season friendly",
+    "sb-cup", "intercontinental cup",
 ]
 
 # Mapa: palabra clave encontrada -> slug ESPN
@@ -62,6 +71,24 @@ _KEYWORD_TO_ESPN_SLUG = {
     "copa américa":       "conmebol.america",
     "club world cup":     "fifa.cwc",
     "world cup":          "fifa.world",
+    # ── Amistosos ──────────────────────────────────────────────────────────
+    "international friendly":    "fifa.friendly",
+    "friendly international":    "fifa.friendly",
+    "international friendlies":  "fifa.friendly",
+    "friendly match":            "fifa.friendly",
+    "amistoso internacional":    "fifa.friendly",
+    "amistosos internacionales": "fifa.friendly",
+    "fifa series":               "fifa.friendly",
+    "club friendly":             "club.friendly",
+    "club friendlies":           "club.friendly",
+    "international champions cup": "club.friendly",
+    "audi cup":                  "club.friendly",
+    "emirates cup":              "club.friendly",
+    "florida cup":               "club.friendly",
+    "preseason friendly":        "club.friendly",
+    "pre-season friendly":       "club.friendly",
+    "sb-cup":                    "club.friendly",
+    "intercontinental cup":      "club.friendly",
 }
 
 
@@ -91,6 +118,49 @@ def _get(url: str, params: dict = None) -> Optional[dict]:
 
 def _norm(text: str) -> str:
     return re.sub(r"[^a-z0-9 ]", "", text.lower()).strip()
+
+
+# Selecciones y clubes relevantes para filtrar amistosos sin interés.
+# Si es un amistoso y ninguno de los equipos aparece aquí, se descarta.
+_IMPORTANT_TEAMS = {
+    # Selecciones top
+    "argentina", "brazil", "brasil", "france", "england", "germany",
+    "spain", "espana", "portugal", "netherlands", "holland", "italy", "italia",
+    "belgium", "croatia", "uruguay", "colombia", "chile", "mexico", "usa",
+    "united states", "senegal", "morocco", "japan", "south korea", "australia",
+    "denmark", "austria", "switzerland", "poland", "serbia", "turkey", "nigeria",
+    "ghana", "ecuador", "peru", "venezuela", "paraguay", "bolivia",
+    # Clubes europeos top
+    "real madrid", "barcelona", "atletico madrid", "atletico de madrid",
+    "manchester city", "manchester united", "liverpool", "chelsea", "arsenal",
+    "tottenham", "newcastle",
+    "bayern munich", "borussia dortmund", "bayer leverkusen", "rb leipzig",
+    "paris saint-germain", "psg", "olympique marseille", "marseille",
+    "juventus", "inter", "inter milan", "ac milan", "napoli", "roma", "lazio",
+    "ajax", "psv", "feyenoord",
+    "porto", "benfica", "sporting cp", "sporting lisbon",
+    "celtic", "rangers",
+    # Clubes CONMEBOL top
+    "boca juniors", "river plate", "flamengo", "palmeiras", "atletico mineiro",
+    "fluminense", "sao paulo", "gremio", "corinthians", "santos",
+    "nacional", "penarol", "colo-colo", "universidad de chile",
+    "estudiantes", "independiente", "racing club", "san lorenzo",
+    "america", "club america", "chivas", "guadalajara", "tigres",
+    "olimpia", "libertad", "cerro porteno",
+}
+
+
+def _is_important_friendly(home_name: str, away_name: str) -> bool:
+    """
+    Para amistosos: True si al menos un equipo está en _IMPORTANT_TEAMS.
+    Para partidos de liga oficial siempre retornar True directamente.
+    """
+    h = _norm(home_name)
+    a = _norm(away_name)
+    for team in _IMPORTANT_TEAMS:
+        if team in h or team in a:
+            return True
+    return False
 
 
 def get_events_today(tz_offset: int = -4) -> list[dict]:
@@ -141,6 +211,12 @@ def get_events_today(tz_offset: int = -4) -> list[dict]:
 
             home_name  = ev.get("strHomeTeam", "?")
             away_name  = ev.get("strAwayTeam", "?")
+
+            # Para amistosos filtrar solo equipos relevantes
+            if slug in ("fifa.friendly", "club.friendly"):
+                if not _is_important_friendly(home_name, away_name):
+                    seen.discard(ev_id)
+                    continue
             home_score = ev.get("intHomeScore")
             away_score = ev.get("intAwayScore")
             date_event = ev.get("dateEvent", "")
