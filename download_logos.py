@@ -95,6 +95,7 @@ LEAGUES = [
     # ── Amistosos ─────────────────────────────────────────────────────────────
     ("Amistosos Internacionales", "fifa.friendly"),
     ("Amistosos de Clubes",       "club.friendly"),
+    ("FIFA Series",               "fifa.series")
 ]
 
 # ──────────────────────────────────────────────────────────────────────────────
