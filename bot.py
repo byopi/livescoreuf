@@ -101,6 +101,10 @@ ESPN_LEAGUES = {
     "Clasificación CAF":        "caf.worldq",
     "Mundial de Clubes FIFA":   "fifa.cwc",
     "Mundial FIFA 2026":        "fifa.world",
+    "Amistosos de Países":      "intl.friendly"
+    "FIFA Series":              "fifa.series"
+    "Amistosos de Clubes":      "club.friendly"
+    
 }
 
 ESPN_FINAL  = {
