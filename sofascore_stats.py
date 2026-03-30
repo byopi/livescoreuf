@@ -73,8 +73,7 @@ def _get(url: str) -> dict | None:
                 logger.warning("Sofascore rate limit, esperando 30s...")
                 time.sleep(30)
             elif r.status_code == 403:
-                logger.warning("Sofascore 403 — proxy bloqueado o no configurado (PROXY_URL=%s)",
-                               "configurado" if proxy_url else "NO configurado")
+                logger.warning("Sofascore 403 — proxy bloqueado o no configurado")
                 return None
             elif r.status_code == 404:
                 return None

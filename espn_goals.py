@@ -28,10 +28,8 @@ _SLUGS = [
     "uefa.nations", "conmebol.america",
     "conmebol.worldq", "uefa.worldq", "concacaf.worldq",
     "afc.worldq", "caf.worldq", "fifa.cwc", "fifa.world",
-    "fifa.friendly", "club.friendly",
 ]
 
-# Cache: "home|away" -> (espn_event_id, slug)
 _match_cache: dict[str, tuple[str, str]] = {}
 
 
@@ -88,18 +86,14 @@ def _find_espn_event(home_name: str, away_name: str) -> tuple[Optional[str], str
 
 
 def _is_goal_event(ev: dict) -> bool:
-    """Detecta si un keyEvent es un gol, independiente de mayusculas/formato."""
     type_text = (ev.get("type", {}).get("text") or "").lower()
     type_id   = str(ev.get("type", {}).get("id") or "")
     short     = (ev.get("shortText") or "").lower()
     text      = (ev.get("text") or "").lower()
-
     if "goal" in type_text:
         return True
-    # IDs conocidos de gol en ESPN: 95=goal, 96=own goal, 98=penalty goal
     if type_id in ("95", "96", "98", "99"):
         return True
-    # Texto del evento contiene marcador tipo "1-0", "2-1"
     if re.search(r"\b\d+[-]\d+\b", short) or re.search(r"\b\d+[-]\d+\b", text):
         return True
     return False
@@ -107,7 +101,6 @@ def _is_goal_event(ev: dict) -> bool:
 
 def _parse_goal_event(ev: dict) -> tuple[str, str]:
     scorer = assist = ""
-
     for ath in ev.get("athletes", []):
         role = (ath.get("type") or "").lower()
         name = ath.get("displayName") or ath.get("fullName", "")
@@ -121,7 +114,6 @@ def _parse_goal_event(ev: dict) -> tuple[str, str]:
         if re.search(r"own goal|autogol|en propia", raw, re.I):
             scorer = "Autogol"
         else:
-            # Formato ESPN: "Nombre Apellido Goal - Tipo" o "Nombre 45'"
             m = re.match(r"^(.+?)\s+Goal\b", raw, re.I)
             if m:
                 scorer = m.group(1).strip()
@@ -129,7 +121,6 @@ def _parse_goal_event(ev: dict) -> tuple[str, str]:
                 m = re.match(r"^([\w\s.\-'áéíóúñÁÉÍÓÚÑćąęóźżłšč]+?)\s*[\(\d]", raw)
                 if m:
                     scorer = m.group(1).strip()
-
     return scorer or "", assist or ""
 
 
@@ -138,10 +129,6 @@ def get_espn_scorer(
     away_name: str,
     seen: set = None,
 ) -> list[tuple[str, str, str]]:
-    """
-    Devuelve lista de (scorer, assist, kid) para todos los goles
-    que ESPN tenga registrados en el partido.
-    """
     if seen is None:
         seen = set()
 
@@ -155,35 +142,15 @@ def get_espn_scorer(
         return []
 
     all_key_events = summary.get("keyEvents", [])
-
-    # Log raw completo para diagnostico
-    logger.info(
-        "ESPN keyEvents raw [%s vs %s] (%d eventos): %s",
-        home_name, away_name, len(all_key_events),
-        [
-            {
-                "type": ev.get("type", {}).get("text"),
-                "type_id": ev.get("type", {}).get("id"),
-                "shortText": ev.get("shortText"),
-                "athletes": [
-                    {"role": a.get("type"), "name": a.get("displayName")}
-                    for a in ev.get("athletes", [])
-                ],
-            }
-            for ev in all_key_events
-        ]
-    )
-
     key_events = [ev for ev in all_key_events if _is_goal_event(ev)]
-    logger.info("ESPN goles filtrados: %d de %d keyEvents para %s vs %s",
-                len(key_events), len(all_key_events), home_name, away_name)
+    logger.info("ESPN goles para %s vs %s: %d de %d keyEvents",
+                home_name, away_name, len(key_events), len(all_key_events))
 
     results = []
     for ev in key_events:
         scorer, assist = _parse_goal_event(ev)
         if not scorer:
-            logger.info("ESPN gol sin scorer parseado: shortText='%s'",
-                        ev.get("shortText") or ev.get("text"))
+            logger.info("ESPN gol sin scorer: %s", ev.get("shortText") or ev.get("text"))
             continue
         clock = (ev.get("clock") or {}).get("displayValue", "?")
         kid   = f"espn_{event_id}_{clock}_{scorer}"
