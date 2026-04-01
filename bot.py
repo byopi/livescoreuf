@@ -94,15 +94,16 @@ ESPN_LEAGUES = {
     "Eurocopa":                 "uefa.euro",
     "Copa América":             "conmebol.america",
     # ── Mundial 2026 (clasificatorias + torneo) ────────────────────────────
-    "Clasificación UEFA":       "uefa.worldq",
-    "Clasificación CONMEBOL":   "conmebol.worldq",
-    "Clasificación CONCACAF":   "concacaf.worldq",
-    "Clasificación AFC":        "afc.worldq",
-    "Clasificación CAF":        "caf.worldq",
+    "Clasificación UEFA":       "fifa.uefa.worldq",
+    "Clasificación CONMEBOL":   "fifa.conmebol.worldq",
+    "Clasificación CONCACAF":   "fifa.concacaf.worldq",
+    "Clasificación AFC":        "fifa.afc.worldq",
+    "Clasificación CAF":        "fifa.caf.worldq",
     "Mundial de Clubes FIFA":   "fifa.cwc",
     "Mundial FIFA 2026":        "fifa.world",
-    "Amistosos Países":                "fifa.friendly",
-    "Amistosos Clubes":                "club.friendly",
+    "Amistosos Países":         "fifa.friendly",
+    "Amistosos Clubes":         "club.friendly",
+    "Repesca Mundial":          "fifa.worldq.pl",
     
 }
 
