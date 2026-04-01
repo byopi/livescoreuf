@@ -26,9 +26,9 @@ _SLUGS = [
     "esp.copa_del_rey", "eng.fa", "eng.league_cup",
     "ger.dfb_pokal", "ita.coppa_italia", "fra.coupe_de_france",
     "uefa.nations", "conmebol.america",
-    "conmebol.worldq", "uefa.worldq", "concacaf.worldq",
-    "afc.worldq", "caf.worldq", "fifa.cwc", "fifa.world",
-    "fifa.friendly", "club.friendly",
+    "fifa.conmebol.worldq", "fifa.uefa.worldq", "fifa.concacaf.worldq",
+    "fifa.afc.worldq", "fifa.caf.worldq", "fifa.cwc", "fifa.world",
+    "fifa.friendly", "club.friendly", "fifa.worldq.pl",
 ]
 
 _match_cache: dict[str, tuple[str, str]] = {}
