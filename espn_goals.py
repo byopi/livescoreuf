@@ -28,7 +28,7 @@ _SLUGS = [
     "uefa.nations", "conmebol.america",
     "fifa.conmebol.worldq", "fifa.uefa.worldq", "fifa.concacaf.worldq",
     "fifa.afc.worldq", "fifa.caf.worldq", "fifa.cwc", "fifa.world",
-    "fifa.friendly", "club.friendly", "fifa.worldq.pl",
+    "fifa.friendly", "club.friendly", "fifa.wcq.ply",
 ]
 
 _match_cache: dict[str, tuple[str, str]] = {}
