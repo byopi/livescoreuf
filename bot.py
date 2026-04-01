@@ -103,7 +103,7 @@ ESPN_LEAGUES = {
     "Mundial FIFA 2026":        "fifa.world",
     "Amistosos Países":         "fifa.friendly",
     "Amistosos Clubes":         "club.friendly",
-    "Repesca Mundial":          "fifa.worldq.pl",
+    "Repesca Mundial":          "fifa.wcq.ply",
     
 }
 
