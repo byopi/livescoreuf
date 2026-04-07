@@ -19,6 +19,7 @@ from sofascore_stats import (
     _get as sofascore_get,
 )
 from lineup_image_generator import generate_lineup_images
+from standings_image_generator import generate_standings_image
 from fotmob_stats import get_scorer_assist, find_fotmob_match_id
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from telegram.ext import (
@@ -1300,7 +1301,7 @@ async def cmd_activos(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 @admin_only
 async def cmd_tabla(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
-    /tabla <liga_slug> [jornada] — Genera y publica la tabla de clasificación.
+    /tabla <liga_slug> [jornada] — Genera y publica la tabla de clasificación como imagen.
     Ejemplo: /tabla esp.1
              /tabla eng.1 30
     Usa el slug de ESPN (ej: esp.1, eng.1, ger.1, ita.1, fra.1, uefa.champions).
@@ -1313,62 +1314,74 @@ async def cmd_tabla(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    slug = args[0].strip()
+    slug    = args[0].strip()
     jornada = args[1] if len(args) > 1 else None
 
-    msg = await update.message.reply_text(f"Obteniendo tabla de {slug}...")
+    msg = await update.message.reply_text(f"Generando tabla de {slug}...")
 
     loop = asyncio.get_running_loop()
     try:
-        standings_text = await loop.run_in_executor(
-            _executor, _fetch_standings, slug, jornada
-        )
+        result = await loop.run_in_executor(_executor, _fetch_standings_data, slug, jornada)
     except Exception as exc:
         await msg.edit_text(f"Error obteniendo tabla: {exc}")
         return
 
-    if not standings_text:
+    if not result:
         await msg.edit_text(f"No se pudo obtener la tabla para: {slug}")
         return
 
-    dest = CHANNEL_ID if CHANNEL_ID else ADMIN_ID
+    entries, league_name, week_num = result
+    await msg.edit_text("Generando imagen...")
+
     try:
-        await app_ref.bot.send_message(
+        img_path = await loop.run_in_executor(
+            _executor, generate_standings_image, slug, entries, league_name, week_num
+        )
+    except Exception as exc:
+        await msg.edit_text(f"Error generando imagen: {exc}")
+        return
+
+    dest = CHANNEL_ID if CHANNEL_ID else ADMIN_ID
+    caption = f"*📊 Tabla de clasificación — {league_name}*"
+    if week_num:
+        caption += f"\n#️⃣ Jornada {week_num}"
+    caption += "\n\n_📲 Suscríbete en t.me/iUniversoFootball_"
+
+    try:
+        await app_ref.bot.send_photo(
             chat_id=dest,
-            text=standings_text,
+            photo=open(img_path, "rb"),
+            caption=caption,
             parse_mode="Markdown",
-            disable_web_page_preview=True,
         )
         await msg.edit_text("✅ Tabla publicada en el canal.")
     except Exception as exc:
         await msg.edit_text(f"Error publicando: {exc}")
 
 
-def _fetch_standings(slug: str, jornada: str = None) -> str:
+def _fetch_standings_data(slug: str, jornada: str = None) -> Optional[tuple]:
     """
-    Consulta la tabla de clasificación de ESPN y genera el texto formateado.
+    Consulta la tabla de clasificación de ESPN.
+    Devuelve (entries, league_name, week_num) o None si falla.
     """
     url = f"https://site.web.api.espn.com/apis/v2/sports/soccer/{slug}/standings"
     try:
         r = requests.get(url, headers=ESPN_HEADERS, timeout=12)
         if r.status_code != 200:
             logger.warning("ESPN standings HTTP %s para %s", r.status_code, slug)
-            return ""
+            return None
         data = r.json()
     except Exception as exc:
         logger.error("ESPN standings error: %s", exc)
-        return ""
+        return None
 
-    # Nombre de la liga
     league_name = (data.get("name") or
                    data.get("abbreviation") or
                    next((n for n, s in ESPN_LEAGUES.items() if s == slug), slug))
 
-    # Determinar jornada
     season   = data.get("season", {})
     week_num = jornada or str(season.get("week", {}).get("number", ""))
 
-    # Extraer entradas de la tabla
     entries = []
     groups  = data.get("children", [data])
     for group in groups:
@@ -1383,14 +1396,14 @@ def _fetch_standings(slug: str, jornada: str = None) -> str:
                 except (ValueError, TypeError):
                     return 0.0
 
-            pts  = int(sv("points"))
-            pj   = int(sv("gamesPlayed"))
-            v    = int(sv("wins"))
-            e    = int(sv("ties"))
-            d    = int(sv("losses"))
-            gf   = int(sv("pointsFor"))
-            gc   = int(sv("pointsAgainst"))
-            dg   = int(sv("pointDifferential", str(gf - gc)))
+            pts = int(sv("points"))
+            pj  = int(sv("gamesPlayed"))
+            v   = int(sv("wins"))
+            e   = int(sv("ties"))
+            d   = int(sv("losses"))
+            gf  = int(sv("pointsFor"))
+            gc  = int(sv("pointsAgainst"))
+            dg  = int(sv("pointDifferential", str(gf - gc)))
 
             entries.append({
                 "name": team_name,
@@ -1400,84 +1413,119 @@ def _fetch_standings(slug: str, jornada: str = None) -> str:
             })
 
     if not entries:
-        return ""
+        return None
 
-    # Ordenar por puntos → diferencia de gol → goles a favor
     entries.sort(key=lambda x: (-x["pts"], -x["dg"], -x["gf"]))
+    return entries, league_name, week_num
 
-    # Detectar zonas (solo para ligas de clubes domésticas comunes)
-    n = len(entries)
-    ucl_spots = 4 if slug in ("esp.1","eng.1","ger.1","ita.1","fra.1") else (
-                1 if slug in ("por.1","ned.1","tur.1") else 0)
-    uel_spots = ucl_spots + (1 if ucl_spots > 0 else 0)
-    rel_spots = 3 if slug in ("esp.1","eng.1","ger.1","ita.1","fra.1") else (
-                2 if slug in ("por.1","ned.1","tur.1") else 0)
-    playoff_spots = 1 if rel_spots > 0 else 0   # playoff descenso (posición n-rel-playoff)
 
-    # Determinar primera posición UCL/UEL/descenso
-    ucl_end  = ucl_spots                       # posiciones 0..ucl_end-1
-    uel_end  = uel_spots                       # posición uel_spots-1
-    rel_start = n - rel_spots                  # últimas rel_spots
-    playoff_pos = rel_start - playoff_spots    # antes del descenso
+# ── Resultados del día por liga ────────────────────────────────────────────────
 
-    # Construir tabla texto
-    lines = []
-
-    # Encabezado
-    jornada_str = f"#️⃣ | *Jornada N°{week_num}*" if week_num else ""
-    lines += [
-        "*📊 | TABLA DE CLASIFICACIÓN*",
-        "",
-    ]
-    if jornada_str:
-        lines += [jornada_str, ""]
-
-    # Leyenda de zonas (si aplica)
-    if ucl_spots:
-        ucl_team  = entries[0]["name"] if entries else ""
-        uel_team  = entries[ucl_spots]["name"] if ucl_spots < n else ""
-        rel_teams = [entries[i]["name"] for i in range(rel_start, n)]
-        playoff_team = entries[playoff_pos]["name"] if playoff_spots and playoff_pos < n else ""
-
-        lines.append(f"*🏆 Primer Lugar: {entries[0]['name']}*")
-        if ucl_spots > 1:
-            lines.append(f"*🔵 UCL: {entries[ucl_end-1]['name']} y anteriores*")
-        if uel_spots > ucl_spots and uel_end <= n:
-            lines.append(f"*🟠 UEL: {entries[uel_end-1]['name']}*")
-        if playoff_spots and playoff_team:
-            lines.append(f"*⭕️ Play-offs de descenso: {playoff_team}*")
-        if rel_spots:
-            lines.append(f"*🔴 Descenso: {', '.join(rel_teams)}*")
-        lines.append("")
-
-    # Hashtagliga
-    tag = "".join(w.capitalize() for w in league_name.split())
-    lines.append(f"*#{tag}*")
-    lines.append("")
-
-    # Tabla con columnas: # Equipo  Pj Pts V E D DG
-    header = "*#*  *Equipo*" + " " * 14 + "*Pj  Pts  V  E  D  DG*"
-    lines.append(header)
-    lines.append("─" * 38)
-
-    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
-    for i, t in enumerate(entries, 1):
-        medal = medals.get(i, f"{i:2}.")
-        name  = t["name"][:16].ljust(16)
-        dg_str = (f"+{t['dg']}" if t["dg"] > 0 else str(t["dg"])).rjust(4)
-        row = (
-            f"*{medal}* `{name}  "
-            f"{t['pj']:2}  {t['pts']:3}  "
-            f"{t['v']:2}  {t['e']:2}  {t['d']:2}  "
-            f"{dg_str}`"
+@admin_only
+async def cmd_rd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    /rd <slug> [fecha] — Resultados del día de una liga específica.
+    Ejemplo: /rd esp.1
+             /rd eng.1 2026-04-06
+             /rd ger.1 20260406
+    """
+    args = ctx.args
+    if not args:
+        ligas = "\n".join([f"  {slug} → {name}" for name, slug in list(ESPN_LEAGUES.items())[:12]])
+        await update.message.reply_text(
+            "Uso: /rd <slug> [fecha]\n\n"
+            "Ejemplos:\n  /rd esp.1\n  /rd eng.1 2026-04-06\n\n"
+            "Slugs disponibles:\n" + ligas + "\n  ..."
         )
-        lines.append(row)
+        return
 
-    lines += [
-        "",
-        "*📲 Suscríbete en t.me/iUniversoFootball*",
-    ]
-    return "\n".join(lines)
+    slug = args[0].strip()
+
+    # Parsear fecha opcional
+    if len(args) > 1:
+        raw_date = args[1].strip().replace("-", "")
+        if len(raw_date) == 8 and raw_date.isdigit():
+            date_str = raw_date
+        else:
+            await update.message.reply_text(
+                "Fecha inválida. Usa formato YYYY-MM-DD o YYYYMMDD.\nEjemplo: /rd esp.1 2026-04-06"
+            )
+            return
+    else:
+        date_str = datetime.now(timezone.utc).strftime("%Y%m%d")
+
+    date_display = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
+    league_display = next((n for n, s in ESPN_LEAGUES.items() if s == slug), slug)
+    msg = await update.message.reply_text(
+        f"Buscando resultados de {league_display} — {date_display}..."
+    )
+
+    loop = asyncio.get_running_loop()
+    try:
+        events = await loop.run_in_executor(_executor, _fetch_scoreboard, slug, date_str)
+    except Exception as exc:
+        await msg.edit_text(f"Error consultando ESPN: {exc}")
+        return
+
+    if not events:
+        await msg.edit_text(f"No se encontraron partidos de {league_display} el {date_display}.")
+        return
+
+    STATUS_EMOJI = {
+        "STATUS_FULL_TIME":      "✅",
+        "STATUS_FINAL":          "✅",
+        "STATUS_FINAL_AET":      "✅",
+        "STATUS_FINAL_PEN":      "✅",
+        "STATUS_SHOOTOUT_FINAL": "✅",
+        "STATUS_IN_PROGRESS":    "🔴",
+        "STATUS_HALFTIME":       "⏸️",
+        "STATUS_EXTRA_TIME":     "⏱️",
+        "STATUS_PENALTY":        "🥅",
+        "STATUS_SHOOTOUT":       "🥅",
+        "STATUS_SCHEDULED":      "🕐",
+        "STATUS_POSTPONED":      "⚠️",
+        "STATUS_CANCELED":       "❌",
+    }
+
+    lines = [f"*📅 {league_display} — {date_display}*", ""]
+
+    for ev in events:
+        p      = parse_event(ev)
+        emoji  = STATUS_EMOJI.get(p["status_type"], "•")
+        status = p["status_type"]
+        clock  = p["clock"]
+
+        if status in ESPN_FINAL:
+            suffix = ""
+            if status == "STATUS_FINAL_AET":
+                suffix = " _(AET)_"
+            elif status in ESPN_PENALTIES:
+                suffix = " _(PEN)_"
+            lines.append(
+                f"{emoji} {p['home_name']} *{p['home_score']}-{p['away_score']}* {p['away_name']}{suffix}"
+            )
+        elif status in ESPN_LIVE:
+            clock_str = f" _{clock}'_" if clock and clock != "0" else ""
+            lines.append(
+                f"{emoji} {p['home_name']} *{p['home_score']}-{p['away_score']}* {p['away_name']}{clock_str}"
+            )
+        else:
+            hora = p["kickoff_str"] or "--:--"
+            lines.append(f"{emoji} {hora} | {p['home_name']} vs {p['away_name']}")
+
+    lines += ["", "_📲 Suscríbete en t.me/iUniversoFootball_"]
+    text = "\n".join(lines)
+
+    if len(text) > 4000:
+        chunks = [text[i:i+3900] for i in range(0, len(text), 3900)]
+        await msg.edit_text(chunks[0], parse_mode="Markdown",
+                            disable_web_page_preview=True)
+        for chunk in chunks[1:]:
+            await update.message.reply_text(chunk, parse_mode="Markdown",
+                                            disable_web_page_preview=True)
+    else:
+        await msg.edit_text(text, parse_mode="Markdown",
+                            disable_web_page_preview=True)
 
 
 # Variable global para referencia a la app (se asigna en main())
@@ -1911,6 +1959,7 @@ def main():
     app.add_handler(CommandHandler("stop",     cmd_stop))
     app.add_handler(CommandHandler("rf",       cmd_rf))
     app.add_handler(CommandHandler("tabla",    cmd_tabla))
+    app.add_handler(CommandHandler("rd",       cmd_rd))
     app.add_handler(CommandHandler("test",     cmd_test))
     app.add_handler(CommandHandler("preview",     cmd_preview))
     app.add_handler(CommandHandler("lineup",      cmd_lineup))
