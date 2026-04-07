@@ -145,6 +145,7 @@ class PendingGoal:
     goal_side:    str         = ""
     scorer:       str         = "Obteniendo..."
     assist:       str         = "Obteniendo..."
+    goal_type:    str         = "goal"     # "goal" | "penalty" | "own_goal"
     resolved:     bool        = False
     tg_message:   Optional[Message] = None
     elapsed_secs: float       = 0.0
@@ -164,6 +165,11 @@ class TrackedFixture:
     finished:       bool = False
     lineup_sent:    bool = False
     lineup_tries:   int  = 0
+    result_only:    bool = False           # Solo resultado final, sin goles en vivo
+    in_extra_time:  bool = False           # Está en prórroga
+    in_penalties:   bool = False           # Está en tanda de penales
+    et_notified:    bool = False           # Ya se notificó inicio de prórroga
+    pen_notified:   bool = False           # Ya se notificó inicio de penales
     _sofascore_id:  Optional[str] = None   # ID en Sofascore para livescore
 
 
@@ -171,6 +177,7 @@ class TrackedFixture:
 tracked:       dict[str, TrackedFixture] = {}
 pending_goals: list[PendingGoal]         = []
 resolved_kev:  dict[str, set]            = {}
+result_only_ids: set[str]               = {}   # IDs marcados como solo resultado final
 
 # Cache de eventos del día: {event_id: raw_event_dict}
 # Se rellena en /partidos y se reutiliza en cb_toggle sin re-consultar ESPN
@@ -294,8 +301,20 @@ def parse_event(ev: dict) -> dict:
     }
 
 
-def parse_goal_event(ev: dict) -> tuple[str, str]:
+def parse_goal_event(ev: dict) -> tuple[str, str, str]:
+    """Devuelve (scorer, assist, goal_type) donde goal_type es 'goal'|'penalty'|'own_goal'."""
     scorer = assist = ""
+    goal_type = "goal"
+
+    ev_type_text = (ev.get("type", {}).get("text") or "").lower()
+    ev_type_id   = str(ev.get("type", {}).get("id") or "")
+
+    # Detectar tipo desde el evento
+    if "own goal" in ev_type_text or "autogol" in ev_type_text:
+        goal_type = "own_goal"
+    elif "penalty" in ev_type_text or ev_type_id in ("96", "99"):
+        goal_type = "penalty"
+
     for ath in ev.get("athletes", []):
         role = (ath.get("type") or "").lower()
         name = ath.get("displayName") or ath.get("fullName", "")
@@ -307,7 +326,18 @@ def parse_goal_event(ev: dict) -> tuple[str, str]:
     raw = ev.get("shortText") or ev.get("text", "")
     if not scorer and raw:
         if re.search(r"own goal|autogol|en propia", raw, re.I):
-            scorer = "Autogol"
+            goal_type = "own_goal"
+            # Intentar extraer el nombre del jugador del autogol
+            m = re.match(r"^([\w\s.\-'áéíóúñÁÉÍÓÚÑ]+?)\s+(own goal|autogol)", raw, re.I)
+            if m:
+                scorer = m.group(1).strip()
+            else:
+                scorer = "Autogol"
+        elif re.search(r"\(pen\b|\bpenalty\b|\bpenalti\b", raw, re.I):
+            goal_type = "penalty"
+            m = re.match(r"^([\w\s.\-'áéíóúñÁÉÍÓÚÑ]+?)\s*\(", raw)
+            if m:
+                scorer = m.group(1).strip()
         else:
             m = re.match(r"^([\w\s.\-'áéíóúñÁÉÍÓÚÑ]+?)\s+\d+[''']", raw)
             if m:
@@ -317,7 +347,7 @@ def parse_goal_event(ev: dict) -> tuple[str, str]:
         if m:
             assist = m.group(1).strip()
 
-    return scorer or "", assist or ""
+    return scorer or "", assist or "", goal_type
 
 
 def parse_key_events(summary: dict) -> list[dict]:
@@ -424,7 +454,8 @@ def build_raw_stats_from_espn(summary: dict) -> list[dict]:
 
 def msg_goal(home: str, away: str, hs: int, as_: int,
              league: str, scorer: str, assist: str,
-             side: str = "", elapsed: str = "") -> str:
+             side: str = "", elapsed: str = "",
+             goal_type: str = "goal") -> str:
     minute = f"⌚ {elapsed}'" if elapsed and elapsed != "0" else ""
 
     if side == "home":
@@ -443,15 +474,50 @@ def msg_goal(home: str, away: str, hs: int, as_: int,
     if minute:
         lines.append(minute)
 
-    # Goleador: si aún no se conoce muestra solo el emoji con guion
-    lines.append(f"⚽ {scorer}")
+    # Goleador con indicador de tipo
+    if goal_type == "penalty":
+        scorer_line = f"⚽ {scorer} *(pen.)*" if scorer and scorer not in ("-", "Obteniendo...") else f"⚽ {scorer}"
+    elif goal_type == "own_goal":
+        # Autogol: mostrar nombre si está disponible
+        if scorer and scorer not in ("-", "Obteniendo...", "Autogol"):
+            scorer_line = f"⚽ {scorer} *(en propia)*"
+        else:
+            scorer_line = "⚽ Autogol"
+    else:
+        scorer_line = f"⚽ {scorer}"
 
-    # Asistencia: omitir la línea si no hay datos aún
-    if assist and assist != "-":
+    lines.append(scorer_line)
+
+    # Asistencia: omitir en penales y autogoles
+    if assist and assist != "-" and goal_type == "goal":
         lines.append(f"🅰️ {assist}")
 
     lines += ["", "*📲 Suscribete en t.me/iUniversoFootball*"]
     return "\n".join(lines)
+
+
+def msg_extra_time(home: str, away: str, hs: int, as_: int) -> str:
+    return "\n".join([
+        "*⏱️ | PRÓRROGA*",
+        "",
+        f"*{home} {hs}-{as_} {away}*",
+        "",
+        "_El partido va a tiempo extra._",
+        "",
+        "*📲 Suscribete en t.me/iUniversoFootball*",
+    ])
+
+
+def msg_penalties_start(home: str, away: str, hs: int, as_: int) -> str:
+    return "\n".join([
+        "*🥅 | TANDA DE PENALES*",
+        "",
+        f"*{home} {hs}-{as_} {away}*",
+        "",
+        "_¡Se define desde los once metros!_",
+        "",
+        "*📲 Suscribete en t.me/iUniversoFootball*",
+    ])
 
 
 def msg_final(home: str, away: str, hs: int, as_: int) -> str:
@@ -658,6 +724,7 @@ async def _resolve_goal(app: Application, pg: PendingGoal):
             pg.home_score, pg.away_score,
             pg.league_name, pg.scorer, pg.assist,
             pg.goal_side, pg.elapsed,
+            pg.goal_type,
         )
         if pg.tg_message:
             try:
@@ -702,6 +769,41 @@ async def monitor_loop(app: Application):
                 status = p["status_type"]
                 clock  = p["clock"]
 
+                # ── Actualizar estado ──────────────────────────────────────
+                fix.status = status
+
+                # ── Notificación de inicio de prórroga ────────────────────
+                if status == "STATUS_EXTRA_TIME" and not fix.et_notified:
+                    fix.et_notified    = True
+                    fix.in_extra_time  = True
+                    dest = CHANNEL_ID if CHANNEL_ID else ADMIN_ID
+                    try:
+                        await app.bot.send_message(
+                            chat_id=dest,
+                            text=msg_extra_time(fix.home_name, fix.away_name,
+                                                fix.home_score, fix.away_score),
+                            parse_mode="Markdown",
+                            disable_web_page_preview=True,
+                        )
+                    except Exception as exc:
+                        logger.error("Error enviando prórroga: %s", exc)
+
+                # ── Notificación de inicio de tanda de penales ────────────
+                if status in ("STATUS_PENALTY", "STATUS_SHOOTOUT") and not fix.pen_notified:
+                    fix.pen_notified  = True
+                    fix.in_penalties  = True
+                    dest = CHANNEL_ID if CHANNEL_ID else ADMIN_ID
+                    try:
+                        await app.bot.send_message(
+                            chat_id=dest,
+                            text=msg_penalties_start(fix.home_name, fix.away_name,
+                                                     fix.home_score, fix.away_score),
+                            parse_mode="Markdown",
+                            disable_web_page_preview=True,
+                        )
+                    except Exception as exc:
+                        logger.error("Error enviando penales: %s", exc)
+
                 # ── Gol detectado ──────────────────────────────────────────
                 if new_h != fix.home_score or new_a != fix.away_score:
                     dh   = new_h - fix.home_score
@@ -710,31 +812,33 @@ async def monitor_loop(app: Application):
                     fix.home_score = new_h
                     fix.away_score = new_a
 
-                    dest = CHANNEL_ID if CHANNEL_ID else ADMIN_ID
-                    for _ in range(max(dh + da, 1)):
-                        text = msg_goal(fix.home_name, fix.away_name,
-                                        new_h, new_a, fix.league_name,
-                                        "-", "", side, clock)
-                        try:
-                            sent = await app.bot.send_message(
-                                chat_id=dest, text=text,
-                                parse_mode="Markdown",
-                                disable_web_page_preview=True,
-                            )
-                            pg = PendingGoal(
-                                fixture_id=fid, league_slug=fix.league_slug,
-                                home_name=fix.home_name, away_name=fix.away_name,
-                                home_score=new_h, away_score=new_a,
-                                league_name=fix.league_name, elapsed=clock,
-                                goal_side=side, tg_message=sent,
-                            )
-                            pending_goals.append(pg)
-                            # Lanzar resolución inmediata en paralelo
-                            asyncio.create_task(_resolve_goal(app, pg))
-                            logger.info("⚽ Gol detectado: %s %d-%d %s",
-                                        fix.home_name, new_h, new_a, fix.away_name)
-                        except Exception as exc:
-                            logger.error("Error enviando gol: %s", exc)
+                    # Si es result_only, no se publican goles en vivo
+                    if not fix.result_only:
+                        dest = CHANNEL_ID if CHANNEL_ID else ADMIN_ID
+                        for _ in range(max(dh + da, 1)):
+                            text = msg_goal(fix.home_name, fix.away_name,
+                                            new_h, new_a, fix.league_name,
+                                            "-", "", side, clock)
+                            try:
+                                sent = await app.bot.send_message(
+                                    chat_id=dest, text=text,
+                                    parse_mode="Markdown",
+                                    disable_web_page_preview=True,
+                                )
+                                pg = PendingGoal(
+                                    fixture_id=fid, league_slug=fix.league_slug,
+                                    home_name=fix.home_name, away_name=fix.away_name,
+                                    home_score=new_h, away_score=new_a,
+                                    league_name=fix.league_name, elapsed=clock,
+                                    goal_side=side, tg_message=sent,
+                                )
+                                pending_goals.append(pg)
+                                # Lanzar resolución inmediata en paralelo
+                                asyncio.create_task(_resolve_goal(app, pg))
+                                logger.info("⚽ Gol detectado: %s %d-%d %s",
+                                            fix.home_name, new_h, new_a, fix.away_name)
+                            except Exception as exc:
+                                logger.error("Error enviando gol: %s", exc)
 
                 # Final
                 if status in ESPN_FINAL and not fix.finished:
@@ -953,11 +1057,13 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Comandos:\n"
         "/partidos - Partidos del dia y activar monitoreo\n"
         "/activos  - Ver partidos monitoreados\n"
+        "/rf       - Activar modo Solo Resultado Final por partido\n"
+        "/tabla    - Publicar tabla de clasificación (/tabla esp.1)\n"
         "/stop     - Detener monitoreo de un partido\n"
         "/test     - Preview del post final\n"
         "/preview     - Enviar al canal un ejemplo de alineaciones y gol\n"
         "/lineup      - Enviar alineaciones manualmente al canal\n"
-        "/testlineup  - Preview privado de imágenes de alineación"
+        "/testlineup  - Preview privado de imágenes de alineación\n"
         "/debug    - Diagnóstico de ESPN por liga\n"
         "/espn     - Test directo: /espn <slug> (ej: /espn ita.1)\n"
         "/lineup   - Forzar envío de alineaciones de un partido activo"
@@ -1108,6 +1214,74 @@ async def cmd_partidos(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 @admin_only
+async def cmd_rf(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    /rf — Alterna el modo "Solo Resultado Final" para partidos activos.
+    En este modo el bot NO publica goles en vivo, solo el mensaje de
+    resultado al terminar el partido.
+    Sin argumentos muestra botones para togglear partido por partido.
+    """
+    if not tracked:
+        await update.message.reply_text("No hay partidos monitoreados. Actívalos primero con /partidos.")
+        return
+
+    keyboard = []
+    for fid, fix in tracked.items():
+        estado = "🔇 RF" if fix.result_only else "📡 Live"
+        hora = fix.kickoff_utc.astimezone(TZ).strftime("%H:%M") if fix.kickoff_utc else "--:--"
+        label = f"{estado} | {hora} {fix.home_name} vs {fix.away_name}"
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"rf:{fid}")])
+
+    await update.message.reply_text(
+        "📢 *Modo Resultado Final*\n\n"
+        "Pulsa un partido para alternar entre:\n"
+        "• 📡 *Live* — publica goles en tiempo real\n"
+        "• 🔇 *RF* — solo publica el resultado al finalizar\n",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown",
+    )
+
+
+async def cb_rf(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Callback para togglear result_only de un partido."""
+    query = update.callback_query
+    await query.answer()
+    if query.from_user.id != ADMIN_ID:
+        return
+
+    fid = query.data.split(":")[1]
+    fix = tracked.get(fid)
+    if not fix:
+        try:
+            await query.edit_message_text("Partido no encontrado.")
+        except Exception:
+            pass
+        return
+
+    fix.result_only = not fix.result_only
+    modo = "🔇 Solo Resultado Final" if fix.result_only else "📡 Livescore completo"
+    logger.info("Partido %s → modo: %s", fid, modo)
+
+    # Refrescar teclado
+    keyboard = []
+    for f_id, f in tracked.items():
+        estado = "🔇 RF" if f.result_only else "📡 Live"
+        hora = f.kickoff_utc.astimezone(TZ).strftime("%H:%M") if f.kickoff_utc else "--:--"
+        label = f"{estado} | {hora} {f.home_name} vs {f.away_name}"
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"rf:{f_id}")])
+
+    try:
+        await query.edit_message_reply_markup(InlineKeyboardMarkup(keyboard))
+    except Exception:
+        pass
+    await query.message.reply_text(
+        f"{'🔇' if fix.result_only else '📡'} *{fix.home_name} vs {fix.away_name}*\n"
+        f"Modo: *{modo}*",
+        parse_mode="Markdown",
+    )
+
+
+@admin_only
 async def cmd_activos(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not tracked:
         await update.message.reply_text("No hay partidos monitoreados.")
@@ -1116,8 +1290,198 @@ async def cmd_activos(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     for fid, fix in tracked.items():
         hora = fix.kickoff_utc.astimezone(TZ).strftime("%H:%M") if fix.kickoff_utc else "--:--"
         xi   = "XI ok" if fix.lineup_sent else "XI pendiente"
-        lines.append(f"- {hora} {fix.home_name} {fix.home_score}-{fix.away_score} {fix.away_name} ({fix.league_name}) [{xi}]")
+        modo = " [RF]" if fix.result_only else ""
+        et   = " [ET]" if fix.in_extra_time else ""
+        pen  = " [PEN]" if fix.in_penalties else ""
+        lines.append(f"- {hora} {fix.home_name} {fix.home_score}-{fix.away_score} {fix.away_name} ({fix.league_name}) [{xi}]{modo}{et}{pen}")
     await update.message.reply_text("\n".join(lines))
+
+
+@admin_only
+async def cmd_tabla(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    /tabla <liga_slug> [jornada] — Genera y publica la tabla de clasificación.
+    Ejemplo: /tabla esp.1
+             /tabla eng.1 30
+    Usa el slug de ESPN (ej: esp.1, eng.1, ger.1, ita.1, fra.1, uefa.champions).
+    """
+    args = ctx.args
+    if not args:
+        ligas = "\n".join([f"  {slug} → {name}" for name, slug in list(ESPN_LEAGUES.items())[:15]])
+        await update.message.reply_text(
+            "Uso: /tabla <slug>\n\nSlug de liga (ESPN):\n" + ligas + "\n  ...",
+        )
+        return
+
+    slug = args[0].strip()
+    jornada = args[1] if len(args) > 1 else None
+
+    msg = await update.message.reply_text(f"Obteniendo tabla de {slug}...")
+
+    loop = asyncio.get_running_loop()
+    try:
+        standings_text = await loop.run_in_executor(
+            _executor, _fetch_standings, slug, jornada
+        )
+    except Exception as exc:
+        await msg.edit_text(f"Error obteniendo tabla: {exc}")
+        return
+
+    if not standings_text:
+        await msg.edit_text(f"No se pudo obtener la tabla para: {slug}")
+        return
+
+    dest = CHANNEL_ID if CHANNEL_ID else ADMIN_ID
+    try:
+        await app_ref.bot.send_message(
+            chat_id=dest,
+            text=standings_text,
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+        )
+        await msg.edit_text("✅ Tabla publicada en el canal.")
+    except Exception as exc:
+        await msg.edit_text(f"Error publicando: {exc}")
+
+
+def _fetch_standings(slug: str, jornada: str = None) -> str:
+    """
+    Consulta la tabla de clasificación de ESPN y genera el texto formateado.
+    """
+    url = f"https://site.web.api.espn.com/apis/v2/sports/soccer/{slug}/standings"
+    try:
+        r = requests.get(url, headers=ESPN_HEADERS, timeout=12)
+        if r.status_code != 200:
+            logger.warning("ESPN standings HTTP %s para %s", r.status_code, slug)
+            return ""
+        data = r.json()
+    except Exception as exc:
+        logger.error("ESPN standings error: %s", exc)
+        return ""
+
+    # Nombre de la liga
+    league_name = (data.get("name") or
+                   data.get("abbreviation") or
+                   next((n for n, s in ESPN_LEAGUES.items() if s == slug), slug))
+
+    # Determinar jornada
+    season   = data.get("season", {})
+    week_num = jornada or str(season.get("week", {}).get("number", ""))
+
+    # Extraer entradas de la tabla
+    entries = []
+    groups  = data.get("children", [data])
+    for group in groups:
+        for entry in group.get("standings", {}).get("entries", []):
+            team_name = entry.get("team", {}).get("displayName", "?")
+            stats_raw = {s["name"]: s for s in entry.get("stats", [])}
+
+            def sv(key: str, alt: str = "0") -> float:
+                s = stats_raw.get(key, {})
+                try:
+                    return float(s.get("value", s.get("displayValue", alt)) or 0)
+                except (ValueError, TypeError):
+                    return 0.0
+
+            pts  = int(sv("points"))
+            pj   = int(sv("gamesPlayed"))
+            v    = int(sv("wins"))
+            e    = int(sv("ties"))
+            d    = int(sv("losses"))
+            gf   = int(sv("pointsFor"))
+            gc   = int(sv("pointsAgainst"))
+            dg   = int(sv("pointDifferential", str(gf - gc)))
+
+            entries.append({
+                "name": team_name,
+                "pts": pts, "pj": pj,
+                "v": v, "e": e, "d": d,
+                "gf": gf, "gc": gc, "dg": dg,
+            })
+
+    if not entries:
+        return ""
+
+    # Ordenar por puntos → diferencia de gol → goles a favor
+    entries.sort(key=lambda x: (-x["pts"], -x["dg"], -x["gf"]))
+
+    # Detectar zonas (solo para ligas de clubes domésticas comunes)
+    n = len(entries)
+    ucl_spots = 4 if slug in ("esp.1","eng.1","ger.1","ita.1","fra.1") else (
+                1 if slug in ("por.1","ned.1","tur.1") else 0)
+    uel_spots = ucl_spots + (1 if ucl_spots > 0 else 0)
+    rel_spots = 3 if slug in ("esp.1","eng.1","ger.1","ita.1","fra.1") else (
+                2 if slug in ("por.1","ned.1","tur.1") else 0)
+    playoff_spots = 1 if rel_spots > 0 else 0   # playoff descenso (posición n-rel-playoff)
+
+    # Determinar primera posición UCL/UEL/descenso
+    ucl_end  = ucl_spots                       # posiciones 0..ucl_end-1
+    uel_end  = uel_spots                       # posición uel_spots-1
+    rel_start = n - rel_spots                  # últimas rel_spots
+    playoff_pos = rel_start - playoff_spots    # antes del descenso
+
+    # Construir tabla texto
+    lines = []
+
+    # Encabezado
+    jornada_str = f"#️⃣ | *Jornada N°{week_num}*" if week_num else ""
+    lines += [
+        "*📊 | TABLA DE CLASIFICACIÓN*",
+        "",
+    ]
+    if jornada_str:
+        lines += [jornada_str, ""]
+
+    # Leyenda de zonas (si aplica)
+    if ucl_spots:
+        ucl_team  = entries[0]["name"] if entries else ""
+        uel_team  = entries[ucl_spots]["name"] if ucl_spots < n else ""
+        rel_teams = [entries[i]["name"] for i in range(rel_start, n)]
+        playoff_team = entries[playoff_pos]["name"] if playoff_spots and playoff_pos < n else ""
+
+        lines.append(f"*🏆 Primer Lugar: {entries[0]['name']}*")
+        if ucl_spots > 1:
+            lines.append(f"*🔵 UCL: {entries[ucl_end-1]['name']} y anteriores*")
+        if uel_spots > ucl_spots and uel_end <= n:
+            lines.append(f"*🟠 UEL: {entries[uel_end-1]['name']}*")
+        if playoff_spots and playoff_team:
+            lines.append(f"*⭕️ Play-offs de descenso: {playoff_team}*")
+        if rel_spots:
+            lines.append(f"*🔴 Descenso: {', '.join(rel_teams)}*")
+        lines.append("")
+
+    # Hashtagliga
+    tag = "".join(w.capitalize() for w in league_name.split())
+    lines.append(f"*#{tag}*")
+    lines.append("")
+
+    # Tabla con columnas: # Equipo  Pj Pts V E D DG
+    header = "*#*  *Equipo*" + " " * 14 + "*Pj  Pts  V  E  D  DG*"
+    lines.append(header)
+    lines.append("─" * 38)
+
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    for i, t in enumerate(entries, 1):
+        medal = medals.get(i, f"{i:2}.")
+        name  = t["name"][:16].ljust(16)
+        dg_str = (f"+{t['dg']}" if t["dg"] > 0 else str(t["dg"])).rjust(4)
+        row = (
+            f"*{medal}* `{name}  "
+            f"{t['pj']:2}  {t['pts']:3}  "
+            f"{t['v']:2}  {t['e']:2}  {t['d']:2}  "
+            f"{dg_str}`"
+        )
+        lines.append(row)
+
+    lines += [
+        "",
+        "*📲 Suscríbete en t.me/iUniversoFootball*",
+    ]
+    return "\n".join(lines)
+
+
+# Variable global para referencia a la app (se asigna en main())
+app_ref = None
 
 
 @admin_only
@@ -1533,16 +1897,20 @@ async def post_init(app: Application):
 
 
 def main():
+    global app_ref
     app = (
         Application.builder()
         .token(BOT_TOKEN)
         .post_init(post_init)
         .build()
     )
+    app_ref = app
     app.add_handler(CommandHandler("start",    cmd_start))
     app.add_handler(CommandHandler("partidos", cmd_partidos))
     app.add_handler(CommandHandler("activos",  cmd_activos))
     app.add_handler(CommandHandler("stop",     cmd_stop))
+    app.add_handler(CommandHandler("rf",       cmd_rf))
+    app.add_handler(CommandHandler("tabla",    cmd_tabla))
     app.add_handler(CommandHandler("test",     cmd_test))
     app.add_handler(CommandHandler("preview",     cmd_preview))
     app.add_handler(CommandHandler("lineup",      cmd_lineup))
@@ -1550,6 +1918,7 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_lineup, pattern=r"^lin:"))
     app.add_handler(CommandHandler("lineup",      cmd_lineup))
     app.add_handler(CallbackQueryHandler(cb_lineup, pattern=r"^lup:"))
+    app.add_handler(CallbackQueryHandler(cb_rf,    pattern=r"^rf:"))
     app.add_handler(CommandHandler("espn",     cmd_espn))
     app.add_handler(CommandHandler("debug",    cmd_debug))
     app.add_handler(CommandHandler("debug",    cmd_debug))
