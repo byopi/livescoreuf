@@ -497,6 +497,31 @@ def msg_goal(home: str, away: str, hs: int, as_: int,
     return "\n".join(lines)
 
 
+def msg_goal_cancelled(home: str, away: str, hs: int, as_: int,
+                       side: str = "", elapsed: str = "",
+                       player: str = "") -> str:
+    """Mensaje de gol anulado por VAR."""
+    if side == "home":
+        score = f"[{hs}]\u2013{as_}"
+    elif side == "away":
+        score = f"{hs}\u2013[{as_}]"
+    else:
+        score = f"{hs}\u2013{as_}"
+
+    lines = [
+        "*🚩 | GOL ANULADO*",
+        "",
+        f"*{home} {score} {away}*",
+        "",
+    ]
+    if elapsed and elapsed != "0":
+        lines.append(f"⌚️ {elapsed}'")
+    if player:
+        lines.append(f"❌ {player}")
+    lines += ["", "*📲 Suscribete en t.me/iUniversoFootball*"]
+    return "\n".join(lines)
+
+
 def msg_extra_time(home: str, away: str, hs: int, as_: int) -> str:
     return "\n".join([
         "*⏱️ | PRÓRROGA*",
@@ -1056,20 +1081,49 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = (
         "Bot Universo Football activo\n\n"
         "Comandos:\n"
-        "/partidos - Partidos del dia y activar monitoreo\n"
-        "/activos  - Ver partidos monitoreados\n"
-        "/rf       - Activar modo Solo Resultado Final por partido\n"
-        "/tabla    - Publicar tabla de clasificación (/tabla esp.1)\n"
-        "/stop     - Detener monitoreo de un partido\n"
-        "/test     - Preview del post final\n"
+        "/partidos    - Partidos del dia y activar monitoreo\n"
+        "/activos     - Ver partidos monitoreados\n"
+        "/rf          - Activar modo Solo Resultado Final\n"
+        "/tabla       - Tabla de clasificación en imagen (/tabla esp.1)\n"
+        "/rd          - Resultados por liga en imagen (/rd esp.1 2026-04-06)\n"
+        "/ligas       - Ver todos los slugs de ligas disponibles\n"
+        "/stop        - Detener monitoreo de un partido\n"
+        "/test        - Preview del post final\n"
         "/preview     - Enviar al canal un ejemplo de alineaciones y gol\n"
         "/lineup      - Enviar alineaciones manualmente al canal\n"
         "/testlineup  - Preview privado de imágenes de alineación\n"
-        "/debug    - Diagnóstico de ESPN por liga\n"
-        "/espn     - Test directo: /espn <slug> (ej: /espn ita.1)\n"
-        "/lineup   - Forzar envío de alineaciones de un partido activo"
+        "/debug       - Diagnóstico de ESPN por liga\n"
+        "/espn        - Test directo: /espn <slug> (ej: /espn ita.1)"
     )
     await update.message.reply_text(text)
+
+
+@admin_only
+async def cmd_ligas(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    /ligas — Muestra todos los slugs de ESPN disponibles organizados por región.
+    """
+    sections = {
+        "🇮🇹 Italia":      ["Serie A", "Coppa Italia", "Supercopa de Italia"],
+        "🇪🇸 España":      ["La Liga", "Copa del Rey", "Supercopa de España"],
+        "🇫🇷 Francia":     ["Ligue 1", "Coupe de France", "Trophée des Champions"],
+        "🇩🇪 Alemania":    ["Bundesliga", "DFB-Pokal", "Supercopa de Alemania"],
+        "🏴󠁧󠁢󠁥󠁮󠁧󠁿 Inglaterra": ["Premier League", "FA Cup", "EFL Cup", "Community Shield"],
+        "🇪🇺 UEFA":        ["Champions League", "Europa League", "Conference League", "Supercopa de Europa", "Nations League", "Eurocopa"],
+        "🌎 CONMEBOL":     ["Copa Libertadores", "Copa Sudamericana", "Recopa Sudamericana", "Copa América"],
+        "🌍 Clasificatorias": ["Clasificación UEFA", "Clasificación CONMEBOL", "Clasificación CONCACAF", "Clasificación AFC", "Clasificación CAF"],
+        "🌐 FIFA":         ["Mundial de Clubes FIFA", "Mundial FIFA 2026", "Amistosos Países", "Amistosos Clubes", "Repesca Mundial"],
+    }
+    lines = ["*⚽ Slugs de ligas disponibles (ESPN)*", ""]
+    for region, league_names in sections.items():
+        lines.append(f"*{region}*")
+        for name in league_names:
+            slug = ESPN_LEAGUES.get(name)
+            if slug:
+                lines.append(f"  `{slug}` → {name}")
+        lines.append("")
+    lines.append("_Uso: /tabla <slug>  |  /rd <slug> [fecha]_")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 @admin_only
@@ -1342,10 +1396,7 @@ async def cmd_tabla(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     dest = CHANNEL_ID if CHANNEL_ID else ADMIN_ID
-    caption = f"*📊 Tabla de clasificación — {league_name}*"
-    if week_num:
-        caption += f"\n#️⃣ Jornada {week_num}"
-    caption += "\n\n_📲 Suscríbete en t.me/iUniversoFootball_"
+    caption = _build_standings_caption(slug, entries, league_name)
 
     try:
         await app_ref.bot.send_photo(
@@ -1357,6 +1408,74 @@ async def cmd_tabla(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text("✅ Tabla publicada en el canal.")
     except Exception as exc:
         await msg.edit_text(f"Error publicando: {exc}")
+
+
+def _build_standings_caption(slug: str, entries: list, league_name: str) -> str:
+    """
+    Genera el caption de la tabla con el formato exacto:
+
+    *📊 | TABLA DE CLASIFICACIÓN*
+
+    *🏆 Primer Lugar: Barcelona*
+    *🔵 UCL: Real Madrid, Villarreal, Atlético Madrid*
+    *🟠 UEL: Real Betis*
+    [*⭕️ Play-offs de descenso: Elche*]
+    *🔴 Descenso: Levante, Real Oviedo*
+
+    *📲 Suscríbete en t.me/iUniversoFootball*
+    """
+    n = len(entries)
+    lines = ["*📊 | TABLA DE CLASIFICACIÓN*", ""]
+
+    # Ligas con playoff de descenso: Bundesliga y Ligue 1
+    HAS_PLAYOFF = {"ger.1", "fra.1"}
+
+    if slug in ("esp.1", "eng.1", "ger.1", "ita.1", "fra.1"):
+        ucl_spots  = 4
+        uel_spots  = 1    # posición 5
+        uecl_spots = 1    # posición 6
+        rel_spots  = 3
+        playoff    = slug in HAS_PLAYOFF
+    elif slug in ("por.1", "ned.1", "tur.1"):
+        ucl_spots  = 1
+        uel_spots  = 1
+        uecl_spots = 1
+        rel_spots  = 2
+        playoff    = False
+    else:
+        ucl_spots = uel_spots = uecl_spots = rel_spots = 0
+        playoff = False
+
+    if ucl_spots and n >= ucl_spots:
+        lines.append(f"*🏆 Primer Lugar: {entries[0]['name']}*")
+
+        ucl_teams = [entries[i]["name"] for i in range(1, ucl_spots)]
+        if ucl_teams:
+            lines.append(f"*🔵 UCL: {', '.join(ucl_teams)}*")
+
+        if uel_spots and ucl_spots < n:
+            uel_name = entries[ucl_spots]["name"]
+            lines.append(f"*🟠 UEL: {uel_name}*")
+
+        if uecl_spots and ucl_spots + uel_spots < n:
+            uecl_name = entries[ucl_spots + uel_spots]["name"]
+            lines.append(f"*🟢 UECL: {uecl_name}*")
+
+        rel_start = n - rel_spots
+        # Playoff: la posición justo antes del descenso directo
+        if playoff and rel_start > 0:
+            playoff_idx = rel_start - 1
+            if playoff_idx < n:
+                lines.append(f"*⭕️ Play-offs de descenso: {entries[playoff_idx]['name']}*")
+
+        if rel_spots:
+            rel_teams = [entries[i]["name"] for i in range(rel_start, n)]
+            lines.append(f"*🔴 Descenso: {', '.join(rel_teams)}*")
+
+        lines.append("")
+
+    lines.append("*📲 Suscríbete en t.me/iUniversoFootball*")
+    return "\n".join(lines)
 
 
 def _fetch_standings_data(slug: str, jornada: str = None) -> Optional[tuple]:
@@ -1419,23 +1538,42 @@ def _fetch_standings_data(slug: str, jornada: str = None) -> Optional[tuple]:
     return entries, league_name, week_num
 
 
-# ── Resultados del día por liga ────────────────────────────────────────────────
+# ── Resultados del día por liga (imagen) ──────────────────────────────────────
+
+# País/bandera por slug para la imagen de resultados
+_SLUG_COUNTRY = {
+    "esp.1": ("España", "🇪🇸"), "esp.copa_del_rey": ("España", "🇪🇸"), "esp.super_cup": ("España", "🇪🇸"),
+    "eng.1": ("Inglaterra", "🏴󠁧󠁢󠁥󠁮󠁧󠁿"), "eng.fa": ("Inglaterra", "🏴󠁧󠁢󠁥󠁮󠁧󠁿"), "eng.league_cup": ("Inglaterra", "🏴󠁧󠁢󠁥󠁮󠁧󠁿"), "eng.community_shield": ("Inglaterra", "🏴󠁧󠁢󠁥󠁮󠁧󠁿"),
+    "ger.1": ("Alemania", "🇩🇪"), "ger.dfb_pokal": ("Alemania", "🇩🇪"), "ger.super_cup": ("Alemania", "🇩🇪"),
+    "ita.1": ("Italia", "🇮🇹"), "ita.coppa_italia": ("Italia", "🇮🇹"), "ita.super_cup": ("Italia", "🇮🇹"),
+    "fra.1": ("Francia", "🇫🇷"), "fra.coupe_de_france": ("Francia", "🇫🇷"), "fra.trophee_champions": ("Francia", "🇫🇷"),
+    "por.1": ("Portugal", "🇵🇹"), "ned.1": ("Países Bajos", "🇳🇱"), "tur.1": ("Turquía", "🇹🇷"),
+    "uefa.champions": ("Europa", "🇪🇺"), "uefa.europa": ("Europa", "🇪🇺"), "uefa.europa.conf": ("Europa", "🇪🇺"),
+    "uefa.super_cup": ("Europa", "🇪🇺"), "uefa.nations": ("Europa", "🇪🇺"), "uefa.euro": ("Europa", "🇪🇺"),
+    "conmebol.libertadores": ("Sudamérica", "🌎"), "conmebol.sudamericana": ("Sudamérica", "🌎"),
+    "conmebol.recopa": ("Sudamérica", "🌎"), "conmebol.america": ("América", "🌎"),
+    "fifa.conmebol.worldq": ("Sudamérica", "🌎"), "fifa.uefa.worldq": ("Europa", "🇪🇺"),
+    "fifa.concacaf.worldq": ("CONCACAF", "🌎"), "fifa.afc.worldq": ("Asia", "🌏"),
+    "fifa.caf.worldq": ("África", "🌍"), "fifa.cwc": ("Mundial", "🌐"),
+    "fifa.world": ("Mundial", "🌐"), "fifa.friendly": ("Internacional", "🌐"),
+    "club.friendly": ("Internacional", "🌐"), "fifa.wcq.ply": ("Internacional", "🌐"),
+}
+
 
 @admin_only
 async def cmd_rd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
-    /rd <slug> [fecha] — Resultados del día de una liga específica.
+    /rd <slug> [fecha] — Resultados del día de una liga específica, en imagen.
     Ejemplo: /rd esp.1
              /rd eng.1 2026-04-06
              /rd ger.1 20260406
     """
     args = ctx.args
     if not args:
-        ligas = "\n".join([f"  {slug} → {name}" for name, slug in list(ESPN_LEAGUES.items())[:12]])
         await update.message.reply_text(
             "Uso: /rd <slug> [fecha]\n\n"
             "Ejemplos:\n  /rd esp.1\n  /rd eng.1 2026-04-06\n\n"
-            "Slugs disponibles:\n" + ligas + "\n  ..."
+            "Usa /ligas para ver todos los slugs disponibles."
         )
         return
 
@@ -1456,76 +1594,114 @@ async def cmd_rd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     date_display = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
     league_display = next((n for n, s in ESPN_LEAGUES.items() if s == slug), slug)
+    country_name, country_flag = _SLUG_COUNTRY.get(slug, ("Internacional", "🌐"))
+
+    # Hashtag de la liga
+    league_tag = "#" + "".join(w.capitalize() for w in league_display.replace("-", " ").split())
+
     msg = await update.message.reply_text(
         f"Buscando resultados de {league_display} — {date_display}..."
     )
 
     loop = asyncio.get_running_loop()
+
+    # ESPN scoreboard con la fecha exacta pedida
     try:
         events = await loop.run_in_executor(_executor, _fetch_scoreboard, slug, date_str)
     except Exception as exc:
         await msg.edit_text(f"Error consultando ESPN: {exc}")
         return
 
+    # Si ESPN no devuelve nada para esa fecha, intentar sin ?dates= (jornada actual)
     if not events:
-        await msg.edit_text(f"No se encontraron partidos de {league_display} el {date_display}.")
+        try:
+            events = await loop.run_in_executor(_executor, _fetch_scoreboard, slug, None)
+            # Filtrar solo los de la fecha pedida
+            target_date = datetime.strptime(date_str, "%Y%m%d").date()
+            filtered = []
+            for ev in events:
+                raw = ev.get("date", "")
+                if raw:
+                    try:
+                        ev_date = datetime.fromisoformat(raw.replace("Z", "+00:00")).date()
+                        if ev_date == target_date:
+                            filtered.append(ev)
+                    except Exception:
+                        pass
+            events = filtered
+        except Exception:
+            pass
+
+    if not events:
+        await msg.edit_text(
+            f"No se encontraron partidos de {league_display} el {date_display}."
+        )
         return
 
-    STATUS_EMOJI = {
-        "STATUS_FULL_TIME":      "✅",
-        "STATUS_FINAL":          "✅",
-        "STATUS_FINAL_AET":      "✅",
-        "STATUS_FINAL_PEN":      "✅",
-        "STATUS_SHOOTOUT_FINAL": "✅",
-        "STATUS_IN_PROGRESS":    "🔴",
-        "STATUS_HALFTIME":       "⏸️",
-        "STATUS_EXTRA_TIME":     "⏱️",
-        "STATUS_PENALTY":        "🥅",
-        "STATUS_SHOOTOUT":       "🥅",
-        "STATUS_SCHEDULED":      "🕐",
-        "STATUS_POSTPONED":      "⚠️",
-        "STATUS_CANCELED":       "❌",
-    }
+    await msg.edit_text("Generando imagen...")
 
-    lines = [f"*📅 {league_display} — {date_display}*", ""]
-
+    # Construir lista de resultados para la imagen
+    results_data = []
     for ev in events:
         p      = parse_event(ev)
-        emoji  = STATUS_EMOJI.get(p["status_type"], "•")
         status = p["status_type"]
-        clock  = p["clock"]
-
         if status in ESPN_FINAL:
             suffix = ""
             if status == "STATUS_FINAL_AET":
-                suffix = " _(AET)_"
+                suffix = "AET"
             elif status in ESPN_PENALTIES:
-                suffix = " _(PEN)_"
-            lines.append(
-                f"{emoji} {p['home_name']} *{p['home_score']}-{p['away_score']}* {p['away_name']}{suffix}"
-            )
+                suffix = "PEN"
+            results_data.append({
+                "home": p["home_name"], "away": p["away_name"],
+                "hs": p["home_score"],  "as_": p["away_score"],
+                "state": "final", "suffix": suffix,
+                "clock": "",
+            })
         elif status in ESPN_LIVE:
-            clock_str = f" _{clock}'_" if clock and clock != "0" else ""
-            lines.append(
-                f"{emoji} {p['home_name']} *{p['home_score']}-{p['away_score']}* {p['away_name']}{clock_str}"
-            )
+            clock = p["clock"] if p["clock"] and p["clock"] != "0" else ""
+            results_data.append({
+                "home": p["home_name"], "away": p["away_name"],
+                "hs": p["home_score"],  "as_": p["away_score"],
+                "state": "live", "suffix": "",
+                "clock": clock,
+            })
         else:
             hora = p["kickoff_str"] or "--:--"
-            lines.append(f"{emoji} {hora} | {p['home_name']} vs {p['away_name']}")
+            results_data.append({
+                "home": p["home_name"], "away": p["away_name"],
+                "hs": None, "as_": None,
+                "state": "scheduled", "suffix": "",
+                "clock": hora,
+            })
 
-    lines += ["", "_📲 Suscríbete en t.me/iUniversoFootball_"]
-    text = "\n".join(lines)
+    try:
+        from results_image_generator import generate_results_image
+        img_path = await loop.run_in_executor(
+            _executor, generate_results_image,
+            results_data, league_display, country_name, country_flag,
+            date_display, league_tag,
+        )
+    except Exception as exc:
+        await msg.edit_text(f"Error generando imagen: {exc}")
+        return
 
-    if len(text) > 4000:
-        chunks = [text[i:i+3900] for i in range(0, len(text), 3900)]
-        await msg.edit_text(chunks[0], parse_mode="Markdown",
-                            disable_web_page_preview=True)
-        for chunk in chunks[1:]:
-            await update.message.reply_text(chunk, parse_mode="Markdown",
-                                            disable_web_page_preview=True)
-    else:
-        await msg.edit_text(text, parse_mode="Markdown",
-                            disable_web_page_preview=True)
+    dest = CHANNEL_ID if CHANNEL_ID else ADMIN_ID
+    caption = (
+        f"*🗓 | RESULTADOS*\n"
+        f"*{country_flag} | {country_name}*\n\n"
+        f"*{league_tag}*\n\n"
+        f"*📲 Suscríbete en t.me/iUniversoFootball*"
+    )
+    try:
+        await app_ref.bot.send_photo(
+            chat_id=dest,
+            photo=open(img_path, "rb"),
+            caption=caption,
+            parse_mode="Markdown",
+        )
+        await msg.edit_text("✅ Resultados publicados en el canal.")
+    except Exception as exc:
+        await msg.edit_text(f"Error publicando: {exc}")
 
 
 # Variable global para referencia a la app (se asigna en main())
@@ -1960,6 +2136,7 @@ def main():
     app.add_handler(CommandHandler("rf",       cmd_rf))
     app.add_handler(CommandHandler("tabla",    cmd_tabla))
     app.add_handler(CommandHandler("rd",       cmd_rd))
+    app.add_handler(CommandHandler("ligas",    cmd_ligas))
     app.add_handler(CommandHandler("test",     cmd_test))
     app.add_handler(CommandHandler("preview",     cmd_preview))
     app.add_handler(CommandHandler("lineup",      cmd_lineup))

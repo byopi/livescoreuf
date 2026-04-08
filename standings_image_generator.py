@@ -92,16 +92,18 @@ def _get_logo_small(team_name: str, size: int = 32) -> Optional[Image.Image]:
 
 def _zone_color(pos: int, n: int, slug: str) -> Optional[tuple]:
     """Devuelve el color de la franja lateral según la zona competitiva."""
-    # Zonas según liga
+    # Bundesliga y Ligue 1 tienen playoff de descenso
+    HAS_PLAYOFF = {"ger.1", "fra.1"}
+
     if slug in ("esp.1", "eng.1", "ger.1", "ita.1", "fra.1"):
-        ucl = 4; uel = 5; uecl = 6; playoff = n - 4; rel = n - 3
+        ucl = 4; uel = 5; uecl = 6
+        rel_count = 3
+        playoff = slug in HAS_PLAYOFF
     elif slug in ("por.1", "ned.1", "tur.1"):
-        ucl = 1; uel = 2; uecl = 3; playoff = n - 3; rel = n - 2
-    elif slug in ("uefa.champions",):
-        ucl = 0; uel = 0; uecl = 0; playoff = 0; rel = 0  # sin zonas en CL
-        return None
+        ucl = 1; uel = 2; uecl = 3
+        rel_count = 2
+        playoff = False
     else:
-        ucl = 0; uel = 0; uecl = 0; playoff = 0; rel = 0
         return None
 
     if pos == 1:
@@ -112,13 +114,14 @@ def _zone_color(pos: int, n: int, slug: str) -> Optional[tuple]:
         return C_UEL
     if uel < pos <= uecl:
         return C_UECL
-    if pos == playoff:
+
+    rel_start = n - rel_count
+    playoff_pos = rel_start - (1 if playoff else 0)
+
+    if playoff and pos == playoff_pos:
         return C_PLAYOFF
-    if pos > playoff and pos <= n:
-        # descenso (últimas 3 o 2 según liga)
-        rel_count = 3 if slug in ("esp.1","eng.1","ger.1","ita.1","fra.1") else 2
-        if pos > n - rel_count:
-            return C_REL
+    if pos > rel_start:
+        return C_REL
     return None
 
 
@@ -270,22 +273,15 @@ def generate_standings_image(
     LEG_Y = ROW_Y0 + n * ROW_H + 8
     if LEGEND_H > 0 and slug in ("esp.1","eng.1","ger.1","ita.1","fra.1",
                                    "por.1","ned.1","tur.1"):
-        zones = []
-        if slug in ("esp.1","eng.1","ger.1","ita.1","fra.1"):
-            zones = [
-                (C_UCL,     "Champions"),
-                (C_UEL,     "Europa L."),
-                (C_UECL,    "Conference"),
-                (C_PLAYOFF, "Playoff"),
-                (C_REL,     "Descenso"),
-            ]
-        else:
-            zones = [
-                (C_UCL,  "Champions"),
-                (C_UEL,  "Europa L."),
-                (C_UECL, "Conference"),
-                (C_REL,  "Descenso"),
-            ]
+        HAS_PLAYOFF = {"ger.1", "fra.1"}
+        zones = [
+            (C_UCL,     "Champions"),
+            (C_UEL,     "Europa L."),
+            (C_UECL,    "Conference"),
+        ]
+        if slug in HAS_PLAYOFF:
+            zones.append((C_PLAYOFF, "Playoff"))
+        zones.append((C_REL, "Descenso"))
         lx = PAD + 14
         for color, label in zones:
             draw.rectangle([lx, LEG_Y+6, lx+14, LEG_Y+22], fill=color)
