@@ -328,21 +328,41 @@ def parse_goal_event(ev: dict) -> tuple[str, str, str]:
     if not scorer and raw:
         if re.search(r"own goal|autogol|en propia", raw, re.I):
             goal_type = "own_goal"
-            # Intentar extraer el nombre del jugador del autogol
             m = re.match(r"^([\w\s.\-'áéíóúñÁÉÍÓÚÑ]+?)\s+(own goal|autogol)", raw, re.I)
             if m:
                 scorer = m.group(1).strip()
             else:
                 scorer = "Autogol"
-        elif re.search(r"\(pen\b|\bpenalty\b|\bpenalti\b", raw, re.I):
+
+        # "Viktor Gyökeres Penalty - Scored"  ← formato real de ESPN para penales
+        elif re.search(r"Penalty\s*-\s*Scored", raw, re.I):
+            goal_type = "penalty"
+            m = re.match(r"^(.+?)\s+Penalty\b", raw, re.I)
+            if m:
+                scorer = m.group(1).strip()
+
+        elif re.search(r"\(pen\b|\bpenalti\b", raw, re.I):
             goal_type = "penalty"
             m = re.match(r"^([\w\s.\-'áéíóúñÁÉÍÓÚÑ]+?)\s*\(", raw)
             if m:
                 scorer = m.group(1).strip()
+
         else:
-            m = re.match(r"^([\w\s.\-'áéíóúñÁÉÍÓÚÑ]+?)\s+\d+[''']", raw)
+            # "Viktor Gyökeres Goal 1-0" → antes de "Goal"
+            m = re.match(r"^(.+?)\s+Goal\b", raw, re.I)
             if m:
                 scorer = m.group(1).strip()
+            # "Nombre 45'" → antes del minuto
+            if not scorer:
+                m = re.match(r"^([\w\s.\-'áéíóúñÁÉÍÓÚÑ]+?)\s+\d+[''']", raw)
+                if m:
+                    scorer = m.group(1).strip()
+            # Último recurso: antes de paréntesis o dígito
+            if not scorer:
+                m = re.match(r"^([\w\s.\-'áéíóúñÁÉÍÓÚÑćąęóźżłšč]+?)\s*[\(\d]", raw)
+                if m:
+                    scorer = m.group(1).strip()
+
     if not assist and raw:
         m = re.search(r"[Aa]ssist[e]?[:\s]+([\w\s.\-'áéíóúñÁÉÍÓÚÑ]+?)[\),\n]", raw)
         if m:

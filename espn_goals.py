@@ -95,6 +95,9 @@ def _is_goal_event(ev: dict) -> bool:
         return True
     if type_id in ("95", "96", "98", "99"):
         return True
+    # "Viktor Gyökeres Penalty - Scored"
+    if re.search(r"penalty\s*-\s*scored", short, re.I) or re.search(r"penalty\s*-\s*scored", text, re.I):
+        return True
     if re.search(r"\b\d+[-]\d+\b", short) or re.search(r"\b\d+[-]\d+\b", text):
         return True
     return False
@@ -115,13 +118,29 @@ def _parse_goal_event(ev: dict) -> tuple[str, str]:
         if re.search(r"own goal|autogol|en propia", raw, re.I):
             scorer = "Autogol"
         else:
+            # "Viktor Gyökeres Goal 1-0"  → capturar antes de "Goal"
             m = re.match(r"^(.+?)\s+Goal\b", raw, re.I)
             if m:
                 scorer = m.group(1).strip()
-            else:
+
+            # "Viktor Gyökeres Penalty - Scored"  → capturar antes de "Penalty"
+            if not scorer:
+                m = re.match(r"^(.+?)\s+Penalty\b", raw, re.I)
+                if m:
+                    scorer = m.group(1).strip()
+
+            # "Viktor Gyökeres (pen.) 45'"  → capturar antes de paréntesis o dígito
+            if not scorer:
                 m = re.match(r"^([\w\s.\-'áéíóúñÁÉÍÓÚÑćąęóźżłšč]+?)\s*[\(\d]", raw)
                 if m:
                     scorer = m.group(1).strip()
+
+            # Último recurso: tomar todo antes del primer número, guion o paréntesis
+            if not scorer:
+                m = re.match(r"^([A-ZÀ-Ža-z][\w\s.\-'áéíóúñÁÉÍÓÚÑ]{2,}?)(?:\s+\d|\s+-\s|\s*\()", raw)
+                if m:
+                    scorer = m.group(1).strip()
+
     return scorer or "", assist or ""
 
 
