@@ -92,10 +92,14 @@ def _get_logo_small(team_name: str, size: int = 32) -> Optional[Image.Image]:
 
 def _zone_color(pos: int, n: int, slug: str) -> Optional[tuple]:
     """Devuelve el color de la franja lateral según la zona competitiva."""
-    # Bundesliga y Ligue 1 tienen playoff de descenso
     HAS_PLAYOFF = {"ger.1", "fra.1"}
 
-    if slug in ("esp.1", "eng.1", "ger.1", "ita.1", "fra.1"):
+    if slug == "eng.1":
+        # Premier League: 5 cupos UCL esta temporada
+        ucl = 5; uel = 6; uecl = 7
+        rel_count = 3
+        playoff = False
+    elif slug in ("esp.1", "ger.1", "ita.1", "fra.1"):
         ucl = 4; uel = 5; uecl = 6
         rel_count = 3
         playoff = slug in HAS_PLAYOFF

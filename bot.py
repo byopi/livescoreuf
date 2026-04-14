@@ -1450,7 +1450,14 @@ def _build_standings_caption(slug: str, entries: list, league_name: str) -> str:
     # Ligas con playoff de descenso: Bundesliga y Ligue 1
     HAS_PLAYOFF = {"ger.1", "fra.1"}
 
-    if slug in ("esp.1", "eng.1", "ger.1", "ita.1", "fra.1"):
+    if slug == "eng.1":
+        # Premier League: 5 cupos UCL esta temporada
+        ucl_spots  = 5
+        uel_spots  = 1    # posición 6
+        uecl_spots = 1    # posición 7
+        rel_spots  = 3
+        playoff    = False
+    elif slug in ("esp.1", "ger.1", "ita.1", "fra.1"):
         ucl_spots  = 4
         uel_spots  = 1    # posición 5
         uecl_spots = 1    # posición 6

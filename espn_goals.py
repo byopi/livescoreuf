@@ -91,12 +91,16 @@ def _is_goal_event(ev: dict) -> bool:
     type_id   = str(ev.get("type", {}).get("id") or "")
     short     = (ev.get("shortText") or "").lower()
     text      = (ev.get("text") or "").lower()
+
     if "goal" in type_text:
         return True
-    if type_id in ("95", "96", "98", "99"):
+    if type_id in ("95", "96", "97", "98", "99", "100"):
         return True
     # "Viktor Gyökeres Penalty - Scored"
     if re.search(r"penalty\s*-\s*scored", short, re.I) or re.search(r"penalty\s*-\s*scored", text, re.I):
+        return True
+    # Cualquier penalty scored
+    if "penalty" in type_text and ("scored" in short or "scored" in text):
         return True
     if re.search(r"\b\d+[-]\d+\b", short) or re.search(r"\b\d+[-]\d+\b", text):
         return True
@@ -105,6 +109,18 @@ def _is_goal_event(ev: dict) -> bool:
 
 def _parse_goal_event(ev: dict) -> tuple[str, str]:
     scorer = assist = ""
+
+    # Log completo del evento para diagnóstico
+    logger.debug(
+        "ESPN parse_event | type_text=%r type_id=%r shortText=%r text=%r athletes=%r",
+        ev.get("type", {}).get("text"),
+        ev.get("type", {}).get("id"),
+        ev.get("shortText"),
+        ev.get("text"),
+        [(a.get("type"), a.get("displayName")) for a in ev.get("athletes", [])],
+    )
+
+    # 1. Intentar por athletes primero (más fiable)
     for ath in ev.get("athletes", []):
         role = (ath.get("type") or "").lower()
         name = ath.get("displayName") or ath.get("fullName", "")
@@ -113,33 +129,54 @@ def _parse_goal_event(ev: dict) -> tuple[str, str]:
         elif role in ("assist", "assister") and name:
             assist = name
 
+    # Si athletes no dio el scorer, parsear shortText / text
     raw = ev.get("shortText") or ev.get("text", "")
     if not scorer and raw:
         if re.search(r"own goal|autogol|en propia", raw, re.I):
             scorer = "Autogol"
         else:
-            # "Viktor Gyökeres Goal 1-0"  → capturar antes de "Goal"
-            m = re.match(r"^(.+?)\s+Goal\b", raw, re.I)
+            # Orden de patrones de más a menos específico:
+
+            # "Name Penalty - Scored"
+            m = re.match(r"^(.+?)\s+Penalty\s*-\s*Scored", raw, re.I)
             if m:
                 scorer = m.group(1).strip()
 
-            # "Viktor Gyökeres Penalty - Scored"  → capturar antes de "Penalty"
+            # "Name Penalty - Missed" / "Name Penalty" (cualquier penalty)
             if not scorer:
                 m = re.match(r"^(.+?)\s+Penalty\b", raw, re.I)
                 if m:
                     scorer = m.group(1).strip()
 
-            # "Viktor Gyökeres (pen.) 45'"  → capturar antes de paréntesis o dígito
+            # "Name Goal 1-0"  o  "Name Goal"
+            if not scorer:
+                m = re.match(r"^(.+?)\s+Goal\b", raw, re.I)
+                if m:
+                    scorer = m.group(1).strip()
+
+            # "Name (pen.) 45'"
+            if not scorer:
+                m = re.match(r"^([\w\s.\-'áéíóúñÁÉÍÓÚÑćąęóźżłšč]+?)\s*\(pen", raw, re.I)
+                if m:
+                    scorer = m.group(1).strip()
+
+            # "Name 45'"  (minuto después del nombre)
+            if not scorer:
+                m = re.match(r"^([\w\s.\-'áéíóúñÁÉÍÓÚÑćąęóźżłšč]+?)\s+\d+[''']", raw)
+                if m:
+                    scorer = m.group(1).strip()
+
+            # Antes de dígito, paréntesis, guion solitario
             if not scorer:
                 m = re.match(r"^([\w\s.\-'áéíóúñÁÉÍÓÚÑćąęóźżłšč]+?)\s*[\(\d]", raw)
                 if m:
                     scorer = m.group(1).strip()
 
-            # Último recurso: tomar todo antes del primer número, guion o paréntesis
-            if not scorer:
-                m = re.match(r"^([A-ZÀ-Ža-z][\w\s.\-'áéíóúñÁÉÍÓÚÑ]{2,}?)(?:\s+\d|\s+-\s|\s*\()", raw)
-                if m:
-                    scorer = m.group(1).strip()
+    if scorer:
+        logger.debug("ESPN scorer extraído: %r de raw=%r", scorer, raw)
+    else:
+        logger.warning("ESPN no pudo extraer scorer de raw=%r | athletes=%r",
+                       raw, [(a.get("type"), a.get("displayName")) for a in ev.get("athletes", [])])
 
     return scorer or "", assist or ""
 
@@ -170,7 +207,12 @@ def get_espn_scorer(
     for ev in key_events:
         scorer, assist = _parse_goal_event(ev)
         if not scorer:
-            logger.info("ESPN gol sin scorer: %s", ev.get("shortText") or ev.get("text"))
+            logger.warning(
+                "ESPN sin scorer | shortText=%r text=%r type=%r athletes=%r",
+                ev.get("shortText"), ev.get("text"),
+                ev.get("type", {}),
+                [(a.get("type"), a.get("displayName")) for a in ev.get("athletes", [])],
+            )
             continue
         clock = (ev.get("clock") or {}).get("displayValue", "?")
         kid   = f"espn_{event_id}_{clock}_{scorer}"
