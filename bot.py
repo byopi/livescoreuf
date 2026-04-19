@@ -90,6 +90,8 @@ ESPN_LEAGUES = {
     "Copa Libertadores":        "conmebol.libertadores",
     "Copa Sudamericana":        "conmebol.sudamericana",
     "Recopa Sudamericana":      "conmebol.recopa",
+    "Liga Argentina":           "arg.1",
+    "Liga FUTVE":               "ven.1",
     # ── Selecciones ────────────────────────────────────────────────────────
     "Nations League":           "uefa.nations",
     "Eurocopa":                 "uefa.euro",
