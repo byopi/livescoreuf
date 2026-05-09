@@ -176,7 +176,8 @@ class TrackedFixture:
     pen_notified:   bool = False           # Ya se notificó inicio de penales
     _sofascore_id:  Optional[str] = None   # ID en Sofascore para livescore
     kickoff_sent:   bool = False           # Ya se notificó inicio en livescore channel
-    goal_log:       list = field(default_factory=list)  # [(elapsed, scorer, goal_type)] para el final
+    halftime_sent:  bool = False           # Ya se notificó descanso en livescore channel
+    goal_log:       list = field(default_factory=list)  # [[elapsed, scorer, goal_type]] para el final
 
 
 # ─── Estado global ─────────────────────────────────────────────────────────────
@@ -670,22 +671,55 @@ def msg_lineup(league: str, home: str, away: str,
     ])
 
 
+# ── Helpers para el canal de livescore ────────────────────────────────────────
+
+def _ls_league_header(league_slug: str, league_name: str) -> str:
+    """Devuelve la línea de cabecera con bandera y nombre de liga."""
+    # Importar el diccionario de banderas (definido más abajo en el módulo,
+    # pero Python lo resuelve en tiempo de ejecución, no de definición)
+    _, flag = _SLUG_COUNTRY.get(league_slug, ("", "🌐"))
+    return f"*{flag} | {league_name}*"
+
+
 # ── Mensajes para el canal de livescore automático ─────────────────────────────
 
-def msg_ls_kickoff(home: str, away: str, league: str) -> str:
+def msg_ls_kickoff(home: str, away: str, hs: int, as_: int,
+                   league_slug: str, league_name: str) -> str:
     """Mensaje de inicio de partido para el canal de livescore."""
+    header = _ls_league_header(league_slug, league_name)
     return "\n".join([
-        "*🟢 | INICIO DEL PARTIDO*",
+        header,
         "",
-        f"*{home} 0-0 {away}*",
-        f"_{league}_",
+        f"*{home} {hs}–{as_} {away}*",
+        "",
+        "↪️ ¡COMIENZA EL PARTIDO!",
+        "",
+        "*📲 Suscribete en t.me/iUniversoFootball*",
+    ])
+
+
+def msg_ls_halftime(home: str, away: str, hs: int, as_: int,
+                    league_slug: str, league_name: str) -> str:
+    """Mensaje de descanso para el canal de livescore."""
+    header = _ls_league_header(league_slug, league_name)
+    return "\n".join([
+        header,
+        "",
+        f"*{home} {hs}–{as_} {away}*",
+        "",
+        "↪️ Acaba la primera mitad",
+        "",
+        "*📲 Suscribete en t.me/iUniversoFootball*",
     ])
 
 
 def msg_ls_goal(home: str, away: str, hs: int, as_: int,
-                league: str, scorer: str, elapsed: str,
+                league_slug: str, league_name: str,
+                scorer: str, elapsed: str,
                 side: str = "", goal_type: str = "goal") -> str:
     """Mensaje de gol para el canal de livescore (sin asistencia)."""
+    header = _ls_league_header(league_slug, league_name)
+
     if side == "home":
         score = f"[{hs}]–{as_}"
     elif side == "away":
@@ -703,39 +737,46 @@ def msg_ls_goal(home: str, away: str, hs: int, as_: int,
         scorer_line = f"⚽ {scorer}" if scorer and scorer not in ("-", "Obteniendo...") else "⚽ Gol"
 
     lines = [
+        header,
         "*🥅 | GOOOOOL!*",
         "",
         f"*{home} {score} {away}*",
-        f"_{league}_",
         "",
     ]
     if minute:
         lines.append(minute)
     lines.append(scorer_line)
+    lines += ["", "*📲 Suscribete en t.me/iUniversoFootball*"]
     return "\n".join(lines)
 
 
 def msg_ls_final(home: str, away: str, hs: int, as_: int,
-                 league: str, goal_log: list) -> str:
+                 league_slug: str, league_name: str,
+                 goal_log: list) -> str:
     """
     Mensaje de final para el canal de livescore.
-    goal_log: lista de (elapsed, scorer, goal_type)
+    goal_log: lista de [elapsed, scorer, goal_type]
     """
+    header = _ls_league_header(league_slug, league_name)
     lines = [
-        "*🔴 | FINAL DEL PARTIDO*",
+        header,
         "",
-        f"*{home} {hs}-{as_} {away}*",
-        f"_{league}_",
+        f"*{home} {hs}–{as_} {away}*",
+        "",
+        "↪️ ¡FINAL DEL PARTIDO!",
     ]
     if goal_log:
         lines.append("")
         for elapsed, scorer, goal_type in goal_log:
+            if scorer in ("-", "Obteniendo...", ""):
+                scorer = "-"
             if goal_type == "penalty":
                 lines.append(f"⚽ {scorer} {elapsed}' *(pen.)*")
             elif goal_type == "own_goal":
                 lines.append(f"⚽ {scorer} {elapsed}' *(en propia)*")
             else:
                 lines.append(f"⚽ {scorer} {elapsed}'")
+    lines += ["", "*📲 Suscribete en t.me/iUniversoFootball*"]
     return "\n".join(lines)
 
 
@@ -973,7 +1014,8 @@ async def _resolve_goal_ls(app: Application, pg: PendingGoal, fix: "TrackedFixtu
         ls_text = msg_ls_goal(
             pg.home_name, pg.away_name,
             pg.home_score, pg.away_score,
-            pg.league_name, scorer_final,
+            fix.league_slug, pg.league_name,
+            scorer_final,
             pg.elapsed, pg.goal_side, goal_type,
         )
         try:
@@ -1021,12 +1063,35 @@ async def monitor_loop(app: Application):
                     try:
                         await app.bot.send_message(
                             chat_id=LIVESCORE_CHANNEL_ID,
-                            text=msg_ls_kickoff(fix.home_name, fix.away_name, fix.league_name),
+                            text=msg_ls_kickoff(
+                                fix.home_name, fix.away_name,
+                                fix.home_score, fix.away_score,
+                                fix.league_slug, fix.league_name,
+                            ),
                             parse_mode="Markdown",
                             disable_web_page_preview=True,
                         )
                     except Exception as exc:
                         logger.error("Error enviando kickoff livescore: %s", exc)
+
+                # ── Notificación de descanso (livescore channel) ───────────────
+                if (LIVESCORE_CHANNEL_ID
+                        and not fix.halftime_sent
+                        and status == "STATUS_HALFTIME"):
+                    fix.halftime_sent = True
+                    try:
+                        await app.bot.send_message(
+                            chat_id=LIVESCORE_CHANNEL_ID,
+                            text=msg_ls_halftime(
+                                fix.home_name, fix.away_name,
+                                fix.home_score, fix.away_score,
+                                fix.league_slug, fix.league_name,
+                            ),
+                            parse_mode="Markdown",
+                            disable_web_page_preview=True,
+                        )
+                    except Exception as exc:
+                        logger.error("Error enviando halftime livescore: %s", exc)
 
                 # ── Notificación de inicio de prórroga ────────────────────
                 if status == "STATUS_EXTRA_TIME" and not fix.et_notified:
@@ -1101,7 +1166,8 @@ async def monitor_loop(app: Application):
                         for _ in range(max(dh + da, 1)):
                             ls_text = msg_ls_goal(
                                 fix.home_name, fix.away_name,
-                                new_h, new_a, fix.league_name,
+                                new_h, new_a,
+                                fix.league_slug, fix.league_name,
                                 "-", clock, side,
                             )
                             try:
@@ -1221,7 +1287,8 @@ async def monitor_loop(app: Application):
                             ls_final_text = msg_ls_final(
                                 fix.home_name, fix.away_name,
                                 fix.home_score, fix.away_score,
-                                fix.league_name, fix.goal_log,
+                                fix.league_slug, fix.league_name,
+                                fix.goal_log,
                             )
                             await app.bot.send_message(
                                 chat_id=LIVESCORE_CHANNEL_ID,
