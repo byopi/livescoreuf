@@ -1300,6 +1300,10 @@ async def monitor_loop(app: Application):
                             logger.error("Error enviando final livescore: %s", exc)
 
                     tracked.pop(fid, None)
+                    # Marcar en ls_state como finalizado para que livescore_loop
+                    # no lo vuelva a procesar si ESPN sigue devolviéndolo
+                    ls_state.setdefault(fid, {})["finished"] = True
+                    ls_state[fid]["finished_at"] = datetime.now(timezone.utc)
 
             except Exception as exc:
                 logger.error("monitor_loop error en %s: %s", fid, exc)
@@ -2616,34 +2620,51 @@ async def livescore_loop(app: Application):
                 # ── FINAL ─────────────────────────────────────────────────────
                 if status in ESPN_FINAL and not st["finished"]:
                     st["finished"] = True
-                    # Pequeña pausa para que los scorers pendientes se resuelvan
-                    await asyncio.sleep(5)
-                    try:
-                        await app.bot.send_message(
-                            chat_id=LIVESCORE_CHANNEL_ID,
-                            text=msg_ls_final(
-                                home, away,
-                                st["home_score"], st["away_score"],
-                                slug, league, st["goal_log"],
-                            ),
-                            parse_mode="Markdown",
-                            disable_web_page_preview=True,
+                    st["finished_at"] = datetime.now(timezone.utc)
+                    # Lanzar el mensaje de final en background para no bloquear
+                    # el loop con el sleep de espera a scorers
+                    asyncio.create_task(
+                        _ls_send_final(
+                            app, home, away,
+                            st["home_score"], st["away_score"],
+                            slug, league, st["goal_log"],
                         )
-                    except Exception as exc:
-                        logger.error("ls_loop final error: %s", exc)
+                    )
 
                 st["status"] = status
 
             except Exception as exc:
                 logger.error("ls_loop error evento %s: %s", ev.get("id", "?"), exc)
 
-        # Limpiar partidos terminados hace más de 2h para no acumular memoria
-        cutoff = datetime.now(timezone.utc) - timedelta(hours=2)
+        # Limpiar partidos terminados hace más de 3h (no antes, para que el
+        # partido siga en ls_state con finished=True y no se reprocese)
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=3)
         for fid in list(ls_state.keys()):
-            if ls_state[fid]["finished"]:
+            st = ls_state[fid]
+            if st.get("finished") and st.get("finished_at", datetime.now(timezone.utc)) < cutoff:
                 ls_state.pop(fid, None)
 
         await asyncio.sleep(POLL_INTERVAL)
+
+
+async def _ls_send_final(
+    app: Application,
+    home: str, away: str,
+    hs: int, as_: int,
+    slug: str, league: str,
+    goal_log: list,
+):
+    """Espera unos segundos a que los scorers se resuelvan y manda el mensaje de final."""
+    await asyncio.sleep(12)   # dar tiempo a _ls_resolve_scorer
+    try:
+        await app.bot.send_message(
+            chat_id=LIVESCORE_CHANNEL_ID,
+            text=msg_ls_final(home, away, hs, as_, slug, league, goal_log),
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+        )
+    except Exception as exc:
+        logger.error("ls_send_final error: %s", exc)
 
 
 async def _ls_resolve_scorer(
