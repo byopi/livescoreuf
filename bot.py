@@ -43,13 +43,14 @@ logger = logging.getLogger(__name__)
 TZ = timezone(timedelta(hours=-4))   # UTC-4
 
 # ─── Config ────────────────────────────────────────────────────────────────────
-BOT_TOKEN        = os.environ["BOT_TOKEN"]
-ADMIN_ID         = int(os.environ["ADMIN_ID"])
-CHANNEL_ID       = os.getenv("CHANNEL_ID", "")
-POLL_INTERVAL    = int(os.getenv("POLL_INTERVAL",    "15"))
-RESOLVE_INTERVAL = int(os.getenv("RESOLVE_INTERVAL", "15"))
-RESOLVE_TIMEOUT  = int(os.getenv("RESOLVE_TIMEOUT",  "180"))
-LINEUP_INTERVAL  = int(os.getenv("LINEUP_INTERVAL",  "120"))
+BOT_TOKEN              = os.environ["BOT_TOKEN"]
+ADMIN_ID               = int(os.environ["ADMIN_ID"])
+CHANNEL_ID             = os.getenv("CHANNEL_ID", "")
+LIVESCORE_CHANNEL_ID   = os.getenv("LIVESCORE_CHANNEL_ID", "")   # Canal de livescore automático
+POLL_INTERVAL          = int(os.getenv("POLL_INTERVAL",    "15"))
+RESOLVE_INTERVAL       = int(os.getenv("RESOLVE_INTERVAL", "15"))
+RESOLVE_TIMEOUT        = int(os.getenv("RESOLVE_TIMEOUT",  "180"))
+LINEUP_INTERVAL        = int(os.getenv("LINEUP_INTERVAL",  "120"))
 
 # ─── ESPN ──────────────────────────────────────────────────────────────────────
 ESPN_SCOREBOARD = "https://site.api.espn.com/apis/site/v2/sports/soccer/{league}/scoreboard"
@@ -174,6 +175,8 @@ class TrackedFixture:
     et_notified:    bool = False           # Ya se notificó inicio de prórroga
     pen_notified:   bool = False           # Ya se notificó inicio de penales
     _sofascore_id:  Optional[str] = None   # ID en Sofascore para livescore
+    kickoff_sent:   bool = False           # Ya se notificó inicio en livescore channel
+    goal_log:       list = field(default_factory=list)  # [(elapsed, scorer, goal_type)] para el final
 
 
 # ─── Estado global ─────────────────────────────────────────────────────────────
@@ -667,6 +670,105 @@ def msg_lineup(league: str, home: str, away: str,
     ])
 
 
+# ── Mensajes para el canal de livescore automático ─────────────────────────────
+
+def msg_ls_kickoff(home: str, away: str, league: str) -> str:
+    """Mensaje de inicio de partido para el canal de livescore."""
+    return "\n".join([
+        "*🟢 | INICIO DEL PARTIDO*",
+        "",
+        f"*{home} 0-0 {away}*",
+        f"_{league}_",
+    ])
+
+
+def msg_ls_goal(home: str, away: str, hs: int, as_: int,
+                league: str, scorer: str, elapsed: str,
+                side: str = "", goal_type: str = "goal") -> str:
+    """Mensaje de gol para el canal de livescore (sin asistencia)."""
+    if side == "home":
+        score = f"[{hs}]–{as_}"
+    elif side == "away":
+        score = f"{hs}–[{as_}]"
+    else:
+        score = f"{hs}–{as_}"
+
+    minute = f"⌚ {elapsed}'" if elapsed and elapsed != "0" else ""
+
+    if goal_type == "penalty":
+        scorer_line = f"⚽ {scorer} *(pen.)*" if scorer and scorer not in ("-", "Obteniendo...") else "⚽ Penal"
+    elif goal_type == "own_goal":
+        scorer_line = f"⚽ {scorer} *(en propia)*" if scorer and scorer not in ("-", "Obteniendo...", "Autogol") else "⚽ Autogol"
+    else:
+        scorer_line = f"⚽ {scorer}" if scorer and scorer not in ("-", "Obteniendo...") else "⚽ Gol"
+
+    lines = [
+        "*🥅 | GOOOOOL!*",
+        "",
+        f"*{home} {score} {away}*",
+        f"_{league}_",
+        "",
+    ]
+    if minute:
+        lines.append(minute)
+    lines.append(scorer_line)
+    return "\n".join(lines)
+
+
+def msg_ls_final(home: str, away: str, hs: int, as_: int,
+                 league: str, goal_log: list) -> str:
+    """
+    Mensaje de final para el canal de livescore.
+    goal_log: lista de (elapsed, scorer, goal_type)
+    """
+    lines = [
+        "*🔴 | FINAL DEL PARTIDO*",
+        "",
+        f"*{home} {hs}-{as_} {away}*",
+        f"_{league}_",
+    ]
+    if goal_log:
+        lines.append("")
+        for elapsed, scorer, goal_type in goal_log:
+            if goal_type == "penalty":
+                lines.append(f"⚽ {scorer} {elapsed}' *(pen.)*")
+            elif goal_type == "own_goal":
+                lines.append(f"⚽ {scorer} {elapsed}' *(en propia)*")
+            else:
+                lines.append(f"⚽ {scorer} {elapsed}'")
+    return "\n".join(lines)
+
+
+def msg_final_with_goals(home: str, away: str, hs: int, as_: int,
+                         goal_log: list) -> str:
+    """
+    Mensaje de final del partido principal con lista de goleadores.
+    Formato exacto pedido por el usuario.
+    goal_log: lista de (elapsed, scorer, goal_type)
+    """
+    lines = [
+        "*📢 | FINAL DEL PARTIDO*",
+        "",
+        f"↪️ {home} {hs}-{as_} {away}",
+    ]
+    if goal_log:
+        lines.append("")
+        for elapsed, scorer, goal_type in goal_log:
+            if goal_type == "penalty":
+                lines.append(f"⚽ {scorer} {elapsed}' *(pen.)*")
+            elif goal_type == "own_goal":
+                lines.append(f"⚽ {scorer} {elapsed}' *(en propia)*")
+            else:
+                lines.append(f"⚽ {scorer} {elapsed}'")
+    lines += [
+        "",
+        "*🎦 Todos los videos de los goles disponibles aqui: t.me/ufgoals*",
+        "",
+        "_⚽ Suscribete en t.me/iUniversoFootball_",
+    ]
+    return "\n".join(lines)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # LOOPS DE BACKGROUND
 # ══════════════════════════════════════════════════════════════════════════════
@@ -786,12 +888,103 @@ async def _resolve_goal(app: Application, pg: PendingGoal):
                 pass
             except Exception as exc:
                 logger.error("Error editando mensaje: %s", exc)
+
+        # Actualizar goal_log del fixture (canal principal)
+        fix = tracked.get(pg.fixture_id)
+        if fix:
+            for entry in fix.goal_log:
+                if entry[0] == pg.elapsed and entry[1] in ("Obteniendo...", "-"):
+                    entry[1] = pg.scorer
+                    entry[2] = pg.goal_type
+                    break
+
     else:
         pg.resolved = True
         logger.warning("Timeout sin goleador: %s vs %s min %s",
                        pg.home_name, pg.away_name, pg.elapsed)
 
     _resolving.discard(pg.fixture_id + pg.elapsed)
+
+
+async def _resolve_goal_ls(app: Application, pg: PendingGoal, fix: "TrackedFixture"):
+    """
+    Versión livescore de la resolución: actualiza el mensaje del canal de livescore
+    y registra el goleador en fix.goal_log en cuanto se resuelve.
+    Espera a que _resolve_goal principal termine (comparte la misma lógica de búsqueda).
+    """
+    loop     = asyncio.get_running_loop()
+    seen     = resolved_kev.setdefault(pg.fixture_id, set())
+    elapsed  = 0
+    interval = RESOLVE_INTERVAL
+
+    while elapsed < RESOLVE_TIMEOUT and not pg.resolved:
+        try:
+            from espn_goals import get_espn_scorer
+            results = await loop.run_in_executor(
+                _executor, get_espn_scorer,
+                pg.home_name, pg.away_name, seen,
+            )
+            for scorer, assist, kid in results:
+                seen.add(kid)
+                pg.scorer   = scorer
+                pg.assist   = assist or ""
+                pg.resolved = True
+                break
+
+            if not pg.resolved:
+                try:
+                    fm = await loop.run_in_executor(
+                        _executor, get_scorer_assist,
+                        pg.home_name, pg.away_name, None,
+                    )
+                    for scorer, assist, kid in fm:
+                        if not scorer or scorer == "-" or kid in seen:
+                            continue
+                        seen.add(kid)
+                        pg.scorer   = scorer
+                        pg.assist   = assist or ""
+                        pg.resolved = True
+                        break
+                except Exception:
+                    pass
+
+        except Exception as exc:
+            logger.debug("_resolve_goal_ls error: %s", exc)
+
+        if pg.resolved:
+            break
+        await asyncio.sleep(interval)
+        elapsed += interval
+
+    # Actualizar goal_log del fixture con el scorer resuelto
+    goal_elapsed = pg.elapsed
+    scorer_final = pg.scorer if pg.resolved and pg.scorer not in ("-", "Obteniendo...") else "-"
+    goal_type    = pg.goal_type
+
+    # Buscar entrada pendiente en goal_log y actualizarla
+    for entry in fix.goal_log:
+        if entry[0] == goal_elapsed and entry[1] == "Obteniendo...":
+            entry[1] = scorer_final
+            entry[2] = goal_type
+            break
+
+    # Editar mensaje en el livescore channel con el scorer final
+    if pg.tg_message and scorer_final and scorer_final != "-":
+        ls_text = msg_ls_goal(
+            pg.home_name, pg.away_name,
+            pg.home_score, pg.away_score,
+            pg.league_name, scorer_final,
+            pg.elapsed, pg.goal_side, goal_type,
+        )
+        try:
+            await pg.tg_message.edit_text(
+                ls_text, parse_mode="Markdown",
+                link_preview_options=_NO_PREVIEW,
+            )
+        except BadRequest:
+            pass
+        except Exception as exc:
+            logger.error("Error editando gol livescore: %s", exc)
 
 
 async def monitor_loop(app: Application):
@@ -819,6 +1012,21 @@ async def monitor_loop(app: Application):
 
                 # ── Actualizar estado ──────────────────────────────────────
                 fix.status = status
+
+                # ── Notificación de inicio de partido (livescore channel) ──────
+                if (LIVESCORE_CHANNEL_ID
+                        and not fix.kickoff_sent
+                        and status in ESPN_LIVE):
+                    fix.kickoff_sent = True
+                    try:
+                        await app.bot.send_message(
+                            chat_id=LIVESCORE_CHANNEL_ID,
+                            text=msg_ls_kickoff(fix.home_name, fix.away_name, fix.league_name),
+                            parse_mode="Markdown",
+                            disable_web_page_preview=True,
+                        )
+                    except Exception as exc:
+                        logger.error("Error enviando kickoff livescore: %s", exc)
 
                 # ── Notificación de inicio de prórroga ────────────────────
                 if status == "STATUS_EXTRA_TIME" and not fix.et_notified:
@@ -860,7 +1068,7 @@ async def monitor_loop(app: Application):
                     fix.home_score = new_h
                     fix.away_score = new_a
 
-                    # Si es result_only, no se publican goles en vivo
+                    # Si es result_only, no se publican goles en vivo en canal principal
                     if not fix.result_only:
                         dest = CHANNEL_ID if CHANNEL_ID else ADMIN_ID
                         for _ in range(max(dh + da, 1)):
@@ -887,6 +1095,38 @@ async def monitor_loop(app: Application):
                                             fix.home_name, new_h, new_a, fix.away_name)
                             except Exception as exc:
                                 logger.error("Error enviando gol: %s", exc)
+
+                    # ── Livescore channel: gol simple (siempre, independiente de result_only) ──
+                    if LIVESCORE_CHANNEL_ID:
+                        for _ in range(max(dh + da, 1)):
+                            ls_text = msg_ls_goal(
+                                fix.home_name, fix.away_name,
+                                new_h, new_a, fix.league_name,
+                                "-", clock, side,
+                            )
+                            try:
+                                ls_sent = await app.bot.send_message(
+                                    chat_id=LIVESCORE_CHANNEL_ID,
+                                    text=ls_text,
+                                    parse_mode="Markdown",
+                                    disable_web_page_preview=True,
+                                )
+                                # PendingGoal separado para el livescore channel
+                                pg_ls = PendingGoal(
+                                    fixture_id=fid + "_ls",
+                                    league_slug=fix.league_slug,
+                                    home_name=fix.home_name, away_name=fix.away_name,
+                                    home_score=new_h, away_score=new_a,
+                                    league_name=fix.league_name, elapsed=clock,
+                                    goal_side=side, tg_message=ls_sent,
+                                )
+                                pending_goals.append(pg_ls)
+                                asyncio.create_task(_resolve_goal_ls(app, pg_ls, fix))
+                            except Exception as exc:
+                                logger.error("Error enviando gol livescore: %s", exc)
+
+                    # Registrar gol en goal_log con scorer pendiente (se actualiza después)
+                    fix.goal_log.append([clock, "Obteniendo...", "goal"])
 
                 # Final
                 if status in ESPN_FINAL and not fix.finished:
@@ -956,8 +1196,14 @@ async def monitor_loop(app: Application):
                                     fix.home_name, fix.home_score,
                                     fix.away_score, fix.away_name)
                     else:
-                        text = msg_final(fix.home_name, fix.away_name,
-                                         fix.home_score, fix.away_score)
+                        # Esperar a que los pending goals del partido estén resueltos
+                        # para tener los goleadores correctos en el mensaje final
+                        await asyncio.sleep(3)
+                        text = msg_final_with_goals(
+                            fix.home_name, fix.away_name,
+                            fix.home_score, fix.away_score,
+                            fix.goal_log,
+                        )
 
                     dest = CHANNEL_ID if CHANNEL_ID else ADMIN_ID
                     try:
@@ -968,6 +1214,23 @@ async def monitor_loop(app: Application):
                             await app.bot.send_message(chat_id=dest, text=text, parse_mode="Markdown", disable_web_page_preview=True)
                     except Exception as exc:
                         logger.error("Error enviando final: %s", exc)
+
+                    # ── Final en livescore channel (sin imagen) ────────────────
+                    if LIVESCORE_CHANNEL_ID:
+                        try:
+                            ls_final_text = msg_ls_final(
+                                fix.home_name, fix.away_name,
+                                fix.home_score, fix.away_score,
+                                fix.league_name, fix.goal_log,
+                            )
+                            await app.bot.send_message(
+                                chat_id=LIVESCORE_CHANNEL_ID,
+                                text=ls_final_text,
+                                parse_mode="Markdown",
+                                disable_web_page_preview=True,
+                            )
+                        except Exception as exc:
+                            logger.error("Error enviando final livescore: %s", exc)
 
                     tracked.pop(fid, None)
 
@@ -1115,7 +1378,9 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/lineup      - Enviar alineaciones manualmente al canal\n"
         "/testlineup  - Preview privado de imágenes de alineación\n"
         "/debug       - Diagnóstico de ESPN por liga\n"
-        "/espn        - Test directo: /espn <slug> (ej: /espn ita.1)"
+        "/espn        - Test directo: /espn <slug> (ej: /espn ita.1)\n\n"
+        f"Canal principal: {CHANNEL_ID or '(no configurado)'}\n"
+        f"Canal livescore: {LIVESCORE_CHANNEL_ID or '(no configurado — set LIVESCORE_CHANNEL_ID)'}"
     )
     await update.message.reply_text(text)
 
