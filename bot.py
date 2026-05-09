@@ -2475,9 +2475,255 @@ async def cmd_preview(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # PUNTO DE ENTRADA
 # ══════════════════════════════════════════════════════════════════════════════
 
+
+# ── Loop de livescore automático (canal LIVESCORE_CHANNEL_ID) ─────────────────
+#
+# Monitorea TODOS los partidos disponibles del día sin necesitar selección manual.
+# Estado por partido se guarda en ls_state: { fixture_id -> dict }
+#
+
+ls_state: dict[str, dict] = {}   # fixture_id -> {home_score, away_score, status, kickoff_sent, halftime_sent, finished, goal_log, slug, league}
+
+
+async def livescore_loop(app: Application):
+    """Loop independiente que hace livescore de todos los partidos del día."""
+    if not LIVESCORE_CHANNEL_ID:
+        logger.info("LIVESCORE_CHANNEL_ID no configurado — livescore_loop inactivo.")
+        return
+
+    logger.info("livescore_loop iniciado → canal %s", LIVESCORE_CHANNEL_ID)
+    loop = asyncio.get_running_loop()
+
+    while True:
+        try:
+            all_events = await fetch_all_today()
+        except Exception as exc:
+            logger.error("livescore_loop fetch error: %s", exc)
+            await asyncio.sleep(POLL_INTERVAL)
+            continue
+
+        for ev in all_events:
+            try:
+                p        = parse_event(ev)
+                fid      = p["id"]
+                status   = p["status_type"]
+                new_h    = p["home_score"]
+                new_a    = p["away_score"]
+                home     = p["home_name"]
+                away     = p["away_name"]
+                clock    = p["clock"] or ""
+                slug     = p["slug"]
+                league   = p["league"]
+
+                # Ignorar partidos que ya están en tracked (monitoreo manual)
+                # para no duplicar mensajes en el livescore channel
+                if fid in tracked:
+                    continue
+
+                # Inicializar estado si es nuevo
+                if fid not in ls_state:
+                    ls_state[fid] = {
+                        "home_score":    0,
+                        "away_score":    0,
+                        "status":        "",
+                        "kickoff_sent":  False,
+                        "halftime_sent": False,
+                        "finished":      False,
+                        "goal_log":      [],
+                        "slug":          slug,
+                        "league":        league,
+                        "ls_goal_seen":  set(),   # elapsed+score strings ya procesados
+                    }
+
+                st = ls_state[fid]
+
+                # Ya terminado → ignorar
+                if st["finished"]:
+                    continue
+
+                # ── INICIO ────────────────────────────────────────────────────
+                if status in ESPN_LIVE and not st["kickoff_sent"] and status != "STATUS_HALFTIME":
+                    st["kickoff_sent"] = True
+                    try:
+                        await app.bot.send_message(
+                            chat_id=LIVESCORE_CHANNEL_ID,
+                            text=msg_ls_kickoff(
+                                home, away, new_h, new_a, slug, league,
+                            ),
+                            parse_mode="Markdown",
+                            disable_web_page_preview=True,
+                        )
+                    except Exception as exc:
+                        logger.error("ls_loop kickoff error: %s", exc)
+
+                # ── DESCANSO ──────────────────────────────────────────────────
+                if status == "STATUS_HALFTIME" and not st["halftime_sent"]:
+                    st["halftime_sent"] = True
+                    # Marcar kickoff como enviado también
+                    st["kickoff_sent"] = True
+                    try:
+                        await app.bot.send_message(
+                            chat_id=LIVESCORE_CHANNEL_ID,
+                            text=msg_ls_halftime(
+                                home, away, new_h, new_a, slug, league,
+                            ),
+                            parse_mode="Markdown",
+                            disable_web_page_preview=True,
+                        )
+                    except Exception as exc:
+                        logger.error("ls_loop halftime error: %s", exc)
+
+                # ── GOL ───────────────────────────────────────────────────────
+                if status in ESPN_LIVE and (new_h != st["home_score"] or new_a != st["away_score"]):
+                    dh   = new_h - st["home_score"]
+                    da   = new_a - st["away_score"]
+                    side = "home" if dh > 0 and da == 0 else "away" if da > 0 and dh == 0 else ""
+                    goal_key = f"{clock}_{new_h}_{new_a}"
+
+                    if goal_key not in st["ls_goal_seen"]:
+                        st["ls_goal_seen"].add(goal_key)
+                        st["home_score"] = new_h
+                        st["away_score"] = new_a
+
+                        for _ in range(max(dh + da, 1)):
+                            ls_text = msg_ls_goal(
+                                home, away, new_h, new_a,
+                                slug, league,
+                                "Obteniendo...", clock, side,
+                            )
+                            try:
+                                sent_msg = await app.bot.send_message(
+                                    chat_id=LIVESCORE_CHANNEL_ID,
+                                    text=ls_text,
+                                    parse_mode="Markdown",
+                                    disable_web_page_preview=True,
+                                )
+                                # Registrar en goal_log con scorer pendiente
+                                entry = [clock, "Obteniendo...", "goal"]
+                                st["goal_log"].append(entry)
+
+                                # Resolver scorer en background
+                                asyncio.create_task(
+                                    _ls_resolve_scorer(
+                                        app, sent_msg, fid,
+                                        home, away, new_h, new_a,
+                                        slug, league, clock, side, entry,
+                                    )
+                                )
+                            except Exception as exc:
+                                logger.error("ls_loop gol error: %s", exc)
+
+                # ── FINAL ─────────────────────────────────────────────────────
+                if status in ESPN_FINAL and not st["finished"]:
+                    st["finished"] = True
+                    # Pequeña pausa para que los scorers pendientes se resuelvan
+                    await asyncio.sleep(5)
+                    try:
+                        await app.bot.send_message(
+                            chat_id=LIVESCORE_CHANNEL_ID,
+                            text=msg_ls_final(
+                                home, away,
+                                st["home_score"], st["away_score"],
+                                slug, league, st["goal_log"],
+                            ),
+                            parse_mode="Markdown",
+                            disable_web_page_preview=True,
+                        )
+                    except Exception as exc:
+                        logger.error("ls_loop final error: %s", exc)
+
+                st["status"] = status
+
+            except Exception as exc:
+                logger.error("ls_loop error evento %s: %s", ev.get("id", "?"), exc)
+
+        # Limpiar partidos terminados hace más de 2h para no acumular memoria
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=2)
+        for fid in list(ls_state.keys()):
+            if ls_state[fid]["finished"]:
+                ls_state.pop(fid, None)
+
+        await asyncio.sleep(POLL_INTERVAL)
+
+
+async def _ls_resolve_scorer(
+    app: Application,
+    sent_msg,
+    fixture_id: str,
+    home: str, away: str,
+    hs: int, as_: int,
+    slug: str, league: str,
+    elapsed: str, side: str,
+    entry: list,          # referencia al entry en goal_log para actualizarlo
+):
+    """Resuelve el goleador de un gol del livescore_loop y edita el mensaje."""
+    loop     = asyncio.get_running_loop()
+    seen_ids = resolved_kev.setdefault(fixture_id + "_ls", set())
+    waited   = 0
+    interval = RESOLVE_INTERVAL
+
+    scorer    = ""
+    goal_type = "goal"
+
+    while waited < RESOLVE_TIMEOUT:
+        try:
+            from espn_goals import get_espn_scorer
+            results = await loop.run_in_executor(
+                _executor, get_espn_scorer, home, away, seen_ids,
+            )
+            for sc, _, kid in results:
+                seen_ids.add(kid)
+                scorer = sc
+                break
+        except Exception:
+            pass
+
+        if not scorer:
+            try:
+                fm = await loop.run_in_executor(
+                    _executor, get_scorer_assist, home, away, None,
+                )
+                for sc, _, kid in fm:
+                    if not sc or sc == "-" or kid in seen_ids:
+                        continue
+                    seen_ids.add(kid)
+                    scorer = sc
+                    break
+            except Exception:
+                pass
+
+        if scorer and scorer not in ("-", "Obteniendo..."):
+            break
+
+        await asyncio.sleep(interval)
+        waited += interval
+
+    # Actualizar entry del goal_log
+    final_scorer = scorer if scorer and scorer not in ("-", "Obteniendo...") else "-"
+    entry[1] = final_scorer
+    entry[2] = goal_type
+
+    # Editar el mensaje con el scorer real
+    if final_scorer != "-":
+        new_text = msg_ls_goal(
+            home, away, hs, as_,
+            slug, league,
+            final_scorer, elapsed, side, goal_type,
+        )
+        try:
+            await sent_msg.edit_text(
+                new_text,
+                parse_mode="Markdown",
+                link_preview_options=_NO_PREVIEW,
+            )
+        except Exception as exc:
+            logger.debug("_ls_resolve_scorer edit error: %s", exc)
+
+
 async def post_init(app: Application):
     app.create_task(monitor_loop(app))
     app.create_task(lineup_loop(app))
+    app.create_task(livescore_loop(app))
     logger.info("Loops iniciados.")
 
 
