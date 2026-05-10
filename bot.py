@@ -2841,6 +2841,20 @@ async def _ls_resolve_scorer(
             logger.debug("_ls_resolve_scorer edit error: %s", exc)
 
 
+async def pre_init(app: Application):
+    """
+    Se ejecuta antes de que el bot empiece a hacer polling.
+    Borra cualquier webhook activo y espera un momento para que Telegram
+    desconecte la instancia anterior — evita el error Conflict en Render.
+    """
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)
+        logger.info("Webhook borrado. Esperando liberación de sesión...")
+    except Exception as exc:
+        logger.warning("delete_webhook error (ignorado): %s", exc)
+    await asyncio.sleep(2)
+
+
 async def post_init(app: Application):
     app.create_task(monitor_loop(app))
     app.create_task(lineup_loop(app))
@@ -2853,6 +2867,7 @@ def main():
     app = (
         Application.builder()
         .token(BOT_TOKEN)
+        .pre_init(pre_init)
         .post_init(post_init)
         .build()
     )
@@ -2880,7 +2895,11 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_test,   pattern=r"^tst:"))
 
     logger.info("Bot iniciado. Polling...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,        # ignora updates acumulados durante el restart
+        close_loop=False,
+    )
 
 
 if __name__ == "__main__":
