@@ -2560,19 +2560,32 @@ async def livescore_loop(app: Application):
 
                 # Inicializar estado si es nuevo
                 if fid not in ls_state:
+                    # Si el partido ya está finalizado al arrancar el bot,
+                    # lo marcamos como finished sin publicar nada
+                    already_done = status in ESPN_FINAL
                     ls_state[fid] = {
-                        "home_score":    0,
-                        "away_score":    0,
-                        "status":        "",
-                        "kickoff_sent":  False,
+                        "home_score":    new_h,   # sincronizar score real desde el inicio
+                        "away_score":    new_a,
+                        "status":        status,
+                        "kickoff_sent":  status in ESPN_LIVE or already_done,
                         "halftime_sent": False,
-                        "finished":      False,
+                        "finished":      already_done,
+                        "finished_at":   datetime.now(timezone.utc) if already_done else None,
                         "goal_log":      [],
                         "slug":          slug,
                         "league":        league,
-                        "espn_event_id": fid,     # ID real de ESPN para ir directo al summary
+                        "espn_event_id": fid,
                         "ls_goal_seen":  set(),
                     }
+                else:
+                    # Siempre mantener el score real actualizado (por si el bot
+                    # arrancó con el partido en curso y no vio todos los goles)
+                    st = ls_state[fid]
+                    if not st["kickoff_sent"] and status in ESPN_LIVE:
+                        # Partido ya en curso cuando arrancamos: sincronizar score
+                        # sin publicar goles que no vimos
+                        st["home_score"] = new_h
+                        st["away_score"] = new_a
 
                 st = ls_state[fid]
 
@@ -2618,8 +2631,14 @@ async def livescore_loop(app: Application):
                     da   = new_a - st["away_score"]
                     side = "home" if dh > 0 and da == 0 else "away" if da > 0 and dh == 0 else ""
 
+                    # Si el bot arrancó con el partido en curso y no mandó kickoff,
+                    # sincronizar score silenciosamente sin publicar goles del pasado
+                    if not st["kickoff_sent"]:
+                        st["home_score"] = new_h
+                        st["away_score"] = new_a
+
                     # ── ANULACIÓN: el score bajó ──────────────────────────
-                    if dh < 0 or da < 0:
+                    elif dh < 0 or da < 0:
                         logger.info("🚩 ls_loop gol anulado: %s %d-%d %s",
                                     home, new_h, new_a, away)
                         st["home_score"] = new_h
@@ -2680,12 +2699,12 @@ async def livescore_loop(app: Application):
                 if status in ESPN_FINAL and not st["finished"]:
                     st["finished"] = True
                     st["finished_at"] = datetime.now(timezone.utc)
-                    # Lanzar el mensaje de final en background para no bloquear
-                    # el loop con el sleep de espera a scorers
+                    # Usar el score real de ESPN (new_h/new_a), no el de ls_state
+                    # por si el bot arrancó tarde y no vio todos los goles
                     asyncio.create_task(
                         _ls_send_final(
                             app, home, away,
-                            st["home_score"], st["away_score"],
+                            new_h, new_a,
                             slug, league, st["goal_log"],
                         )
                     )
