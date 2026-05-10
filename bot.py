@@ -2570,7 +2570,8 @@ async def livescore_loop(app: Application):
                         "goal_log":      [],
                         "slug":          slug,
                         "league":        league,
-                        "ls_goal_seen":  set(),   # elapsed+score strings ya procesados
+                        "espn_event_id": fid,     # ID real de ESPN para ir directo al summary
+                        "ls_goal_seen":  set(),
                     }
 
                 st = ls_state[fid]
@@ -2669,6 +2670,7 @@ async def livescore_loop(app: Application):
                                             app, sent_msg, fid,
                                             home, away, new_h, new_a,
                                             slug, league, clock, side, entry,
+                                            espn_event_id=st["espn_event_id"],
                                         )
                                     )
                                 except Exception as exc:
@@ -2733,8 +2735,12 @@ async def _ls_resolve_scorer(
     slug: str, league: str,
     elapsed: str, side: str,
     entry: list,          # referencia al entry en goal_log para actualizarlo
+    espn_event_id: str = "",
 ):
-    """Resuelve el goleador de un gol del livescore_loop y edita el mensaje."""
+    """
+    Resuelve el goleador de un gol del livescore_loop y edita el mensaje.
+    Usa el event_id + slug directamente para ir al summary sin búsqueda.
+    """
     loop     = asyncio.get_running_loop()
     seen_ids = resolved_kev.setdefault(fixture_id + "_ls", set())
     waited   = 0
@@ -2744,18 +2750,29 @@ async def _ls_resolve_scorer(
     goal_type = "goal"
 
     while waited < RESOLVE_TIMEOUT:
-        try:
-            from espn_goals import get_espn_scorer
-            results = await loop.run_in_executor(
-                _executor, get_espn_scorer, home, away, seen_ids,
-            )
-            for sc, _, kid in results:
-                seen_ids.add(kid)
-                scorer = sc
-                break
-        except Exception:
-            pass
+        # ── 1. ESPN summary directo (tenemos event_id y slug) ─────────────
+        if espn_event_id and slug:
+            try:
+                summary = await loop.run_in_executor(
+                    _executor, _fetch_summary, slug, espn_event_id,
+                )
+                if summary:
+                    for ev in summary.get("keyEvents", []):
+                        sc, ast_, gt = parse_goal_event(ev)
+                        if not sc:
+                            continue
+                        clock_val = (ev.get("clock") or {}).get("displayValue", "?")
+                        kid = f"ls_{espn_event_id}_{clock_val}_{sc}"
+                        if kid in seen_ids:
+                            continue
+                        seen_ids.add(kid)
+                        scorer    = sc
+                        goal_type = gt
+                        break
+            except Exception as exc:
+                logger.debug("_ls_resolve_scorer ESPN summary error: %s", exc)
 
+        # ── 2. FotMob como fallback ────────────────────────────────────────
         if not scorer:
             try:
                 fm = await loop.run_in_executor(
