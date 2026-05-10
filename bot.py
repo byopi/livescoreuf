@@ -248,7 +248,7 @@ def _fetch_all_today() -> list[dict]:
         except Exception as exc:
             logger.debug("ESPN fetch error %s: %s", slug, exc)
 
-    logger.info("ESPN: %d partidos hoy (%s)", len(results), today_utc)
+    logger.debug("ESPN: %d partidos hoy (%s)", len(results), today_utc)
     return results
 
 
@@ -840,12 +840,13 @@ async def _resolve_goal(app: Application, pg: PendingGoal):
                 _executor, get_espn_scorer,
                 pg.home_name, pg.away_name, seen,
             )
-            for scorer, assist, kid in results:
+            for scorer, assist, kid, goal_type in results:
                 seen.add(kid)
-                pg.scorer   = scorer
-                pg.assist   = assist or ""
-                pg.resolved = True
-                logger.info("ESPN resolvio: '%s' asiste '%s'", scorer, assist or "-")
+                pg.scorer    = scorer
+                pg.assist    = assist or ""
+                pg.goal_type = goal_type
+                pg.resolved  = True
+                logger.info("ESPN resolvio: '%s' asiste '%s' tipo '%s'", scorer, assist or "-", goal_type)
                 break
 
             # ── 2. FotMob (fallback) ──────────────────────────────────────
@@ -965,11 +966,12 @@ async def _resolve_goal_ls(app: Application, pg: PendingGoal, fix: "TrackedFixtu
                 _executor, get_espn_scorer,
                 pg.home_name, pg.away_name, seen,
             )
-            for scorer, assist, kid in results:
+            for scorer, assist, kid, goal_type in results:
                 seen.add(kid)
-                pg.scorer   = scorer
-                pg.assist   = assist or ""
-                pg.resolved = True
+                pg.scorer    = scorer
+                pg.assist    = assist or ""
+                pg.goal_type = goal_type
+                pg.resolved  = True
                 break
 
             if not pg.resolved:
@@ -2630,6 +2632,10 @@ async def livescore_loop(app: Application):
                     dh   = new_h - st["home_score"]
                     da   = new_a - st["away_score"]
                     side = "home" if dh > 0 and da == 0 else "away" if da > 0 and dh == 0 else ""
+                    logger.info("ls_loop cambio score: %s %d-%d %s (antes %d-%d) clock=%r kickoff_sent=%s dh=%d da=%d",
+                                home, new_h, new_a, away,
+                                st["home_score"], st["away_score"],
+                                clock, st["kickoff_sent"], dh, da)
 
                     # Si el bot arrancó con el partido en curso y no mandó kickoff,
                     # sincronizar score silenciosamente sin publicar goles del pasado
@@ -2664,6 +2670,7 @@ async def livescore_loop(app: Application):
                     # ── GOL: el score subió ───────────────────────────────
                     else:
                         goal_key = f"{clock}_{new_h}_{new_a}"
+                        logger.info("ls_loop GOL branch: goal_key=%r seen=%s", goal_key, goal_key in st["ls_goal_seen"])
                         if goal_key not in st["ls_goal_seen"]:
                             st["ls_goal_seen"].add(goal_key)
                             st["home_score"] = new_h

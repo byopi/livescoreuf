@@ -107,14 +107,25 @@ def _is_goal_event(ev: dict) -> bool:
     return False
 
 
-def _parse_goal_event(ev: dict) -> tuple[str, str]:
+def _parse_goal_event(ev: dict) -> tuple[str, str, str]:
+    """Devuelve (scorer, assist, goal_type) donde goal_type es 'goal'|'penalty'|'own_goal'."""
     scorer = assist = ""
+    goal_type = "goal"
+
+    type_text = (ev.get("type", {}).get("text") or "").lower()
+    type_id   = str(ev.get("type", {}).get("id") or "")
+
+    # Detectar tipo desde el tipo del evento
+    if "own goal" in type_text or "autogol" in type_text:
+        goal_type = "own_goal"
+    elif "penalty" in type_text or type_id in ("96", "99"):
+        goal_type = "penalty"
 
     # Log completo del evento para diagnóstico
     logger.debug(
         "ESPN parse_event | type_text=%r type_id=%r shortText=%r text=%r athletes=%r",
         ev.get("type", {}).get("text"),
-        ev.get("type", {}).get("id"),
+        type_id,
         ev.get("shortText"),
         ev.get("text"),
         [(a.get("type"), a.get("displayName")) for a in ev.get("athletes", [])],
@@ -129,56 +140,69 @@ def _parse_goal_event(ev: dict) -> tuple[str, str]:
         elif role in ("assist", "assister") and name:
             assist = name
 
-    # Si athletes no dio el scorer, parsear shortText / text
     raw = ev.get("shortText") or ev.get("text", "")
+
+    # 2. Si no hay scorer por athletes, parsear el texto
     if not scorer and raw:
         if re.search(r"own goal|autogol|en propia", raw, re.I):
-            scorer = "Autogol"
+            goal_type = "own_goal"
+            # Intentar extraer el nombre real del autogolador (antes de "own goal")
+            m = re.match(r"^([\w\s.\-'áéíóúñÁÉÍÓÚÑćąęóźżłšč]+?)\s+(own goal|autogol|en propia)", raw, re.I)
+            if m:
+                scorer = m.group(1).strip()
+            else:
+                scorer = "Autogol"
         else:
-            # Orden de patrones de más a menos específico:
-
             # "Name Penalty - Scored"
             m = re.match(r"^(.+?)\s+Penalty\s*-\s*Scored", raw, re.I)
             if m:
                 scorer = m.group(1).strip()
+                goal_type = "penalty"
 
-            # "Name Penalty - Missed" / "Name Penalty" (cualquier penalty)
+            # "Name Penalty" genérico
             if not scorer:
                 m = re.match(r"^(.+?)\s+Penalty\b", raw, re.I)
                 if m:
                     scorer = m.group(1).strip()
+                    goal_type = "penalty"
 
-            # "Name Goal 1-0"  o  "Name Goal"
+            # "Name Goal 1-0" o "Name Goal"
             if not scorer:
                 m = re.match(r"^(.+?)\s+Goal\b", raw, re.I)
                 if m:
                     scorer = m.group(1).strip()
 
-            # "Name (pen.) 45'"
+            # "(pen.)" explícito
             if not scorer:
                 m = re.match(r"^([\w\s.\-'áéíóúñÁÉÍÓÚÑćąęóźżłšč]+?)\s*\(pen", raw, re.I)
                 if m:
                     scorer = m.group(1).strip()
+                    goal_type = "penalty"
 
-            # "Name 45'"  (minuto después del nombre)
+            # "Name 45'"
             if not scorer:
                 m = re.match(r"^([\w\s.\-'áéíóúñÁÉÍÓÚÑćąęóźżłšč]+?)\s+\d+[''']", raw)
                 if m:
                     scorer = m.group(1).strip()
 
-            # Antes de dígito, paréntesis, guion solitario
+            # Antes de dígito o paréntesis
             if not scorer:
                 m = re.match(r"^([\w\s.\-'áéíóúñÁÉÍÓÚÑćąęóźżłšč]+?)\s*[\(\d]", raw)
                 if m:
                     scorer = m.group(1).strip()
 
+    # 3. Detectar penalty también desde el texto si aún no lo marcamos
+    if raw and goal_type == "goal":
+        if re.search(r"Penalty\s*-\s*Scored", raw, re.I) or re.search(r"\(pen\b", raw, re.I):
+            goal_type = "penalty"
+
     if scorer:
-        logger.debug("ESPN scorer extraído: %r de raw=%r", scorer, raw)
+        logger.debug("ESPN scorer extraído: %r goal_type=%r de raw=%r", scorer, goal_type, raw)
     else:
         logger.warning("ESPN no pudo extraer scorer de raw=%r | athletes=%r",
                        raw, [(a.get("type"), a.get("displayName")) for a in ev.get("athletes", [])])
 
-    return scorer or "", assist or ""
+    return scorer or "", assist or "", goal_type
 
 
 def get_espn_scorer(
@@ -205,7 +229,7 @@ def get_espn_scorer(
 
     results = []
     for ev in key_events:
-        scorer, assist = _parse_goal_event(ev)
+        scorer, assist, goal_type = _parse_goal_event(ev)
         if not scorer:
             logger.warning(
                 "ESPN sin scorer | shortText=%r text=%r type=%r athletes=%r",
@@ -218,6 +242,6 @@ def get_espn_scorer(
         kid   = f"espn_{event_id}_{clock}_{scorer}"
         if kid in seen:
             continue
-        results.append((scorer, assist, kid))
+        results.append((scorer, assist, kid, goal_type))
 
     return results
