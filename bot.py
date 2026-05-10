@@ -1125,74 +1125,108 @@ async def monitor_loop(app: Application):
                     except Exception as exc:
                         logger.error("Error enviando penales: %s", exc)
 
-                # ── Gol detectado ──────────────────────────────────────────
+                # ── Cambio de score detectado ──────────────────────────────
                 if new_h != fix.home_score or new_a != fix.away_score:
                     dh   = new_h - fix.home_score
                     da   = new_a - fix.away_score
                     side = "home" if dh > 0 and da == 0 else "away" if da > 0 and dh == 0 else ""
-                    fix.home_score = new_h
-                    fix.away_score = new_a
 
-                    # Si es result_only, no se publican goles en vivo en canal principal
-                    if not fix.result_only:
-                        dest = CHANNEL_ID if CHANNEL_ID else ADMIN_ID
-                        for _ in range(max(dh + da, 1)):
-                            text = msg_goal(fix.home_name, fix.away_name,
-                                            new_h, new_a, fix.league_name,
-                                            "-", "", side, clock)
-                            try:
-                                sent = await app.bot.send_message(
-                                    chat_id=dest, text=text,
-                                    parse_mode="Markdown",
-                                    disable_web_page_preview=True,
-                                )
-                                pg = PendingGoal(
-                                    fixture_id=fid, league_slug=fix.league_slug,
-                                    home_name=fix.home_name, away_name=fix.away_name,
-                                    home_score=new_h, away_score=new_a,
-                                    league_name=fix.league_name, elapsed=clock,
-                                    goal_side=side, tg_message=sent,
-                                )
-                                pending_goals.append(pg)
-                                # Lanzar resolución inmediata en paralelo
-                                asyncio.create_task(_resolve_goal(app, pg))
-                                logger.info("⚽ Gol detectado: %s %d-%d %s",
-                                            fix.home_name, new_h, new_a, fix.away_name)
-                            except Exception as exc:
-                                logger.error("Error enviando gol: %s", exc)
+                    # ── GOL ANULADO: el score bajó ────────────────────────
+                    if dh < 0 or da < 0:
+                        logger.info("🚩 Gol anulado detectado: %s %d-%d %s (era %d-%d)",
+                                    fix.home_name, new_h, new_a, fix.away_name,
+                                    fix.home_score, fix.away_score)
+                        fix.home_score = new_h
+                        fix.away_score = new_a
 
-                    # ── Livescore channel: gol simple (siempre, independiente de result_only) ──
-                    if LIVESCORE_CHANNEL_ID:
-                        for _ in range(max(dh + da, 1)):
-                            ls_text = msg_ls_goal(
-                                fix.home_name, fix.away_name,
-                                new_h, new_a,
-                                fix.league_slug, fix.league_name,
-                                "-", clock, side,
-                            )
-                            try:
-                                ls_sent = await app.bot.send_message(
-                                    chat_id=LIVESCORE_CHANNEL_ID,
-                                    text=ls_text,
-                                    parse_mode="Markdown",
-                                    disable_web_page_preview=True,
-                                )
-                                # PendingGoal separado para el livescore channel
-                                pg_ls = PendingGoal(
-                                    fixture_id=fid + "_ls",
-                                    league_slug=fix.league_slug,
-                                    home_name=fix.home_name, away_name=fix.away_name,
-                                    home_score=new_h, away_score=new_a,
-                                    league_name=fix.league_name, elapsed=clock,
-                                    goal_side=side, tg_message=ls_sent,
-                                )
-                                pending_goals.append(pg_ls)
-                                asyncio.create_task(_resolve_goal_ls(app, pg_ls, fix))
-                            except Exception as exc:
-                                logger.error("Error enviando gol livescore: %s", exc)
+                        # Cancelar el PendingGoal pendiente si aún no se editó
+                        cancelled_side = "home" if dh < 0 else "away"
+                        for pg in reversed(pending_goals):
+                            if pg.fixture_id == fid and pg.goal_side == cancelled_side and not pg.resolved:
+                                pg.resolved = True   # detener la resolución
+                                # Editar el mensaje de gol con el aviso de anulación
+                                try:
+                                    cancel_text = msg_goal_cancelled(
+                                        fix.home_name, fix.away_name,
+                                        new_h, new_a,
+                                        cancelled_side, pg.elapsed, pg.scorer or "",
+                                    )
+                                    await pg.tg_message.edit_text(
+                                        cancel_text, parse_mode="Markdown",
+                                        link_preview_options=_NO_PREVIEW,
+                                    )
+                                except Exception as exc:
+                                    logger.error("Error editando gol anulado: %s", exc)
+                                break
 
-                    # Registrar gol en goal_log con scorer pendiente (se actualiza después)
-                    fix.goal_log.append([clock, "Obteniendo...", "goal"])
+                        # Quitar el último gol del goal_log
+                        if fix.goal_log:
+                            fix.goal_log.pop()
+
+                    # ── GOL: el score subió ───────────────────────────────
+                    else:
+                        fix.home_score = new_h
+                        fix.away_score = new_a
+
+                        # Si es result_only, no se publican goles en vivo en canal principal
+                        if not fix.result_only:
+                            dest = CHANNEL_ID if CHANNEL_ID else ADMIN_ID
+                            for _ in range(max(dh + da, 1)):
+                                text = msg_goal(fix.home_name, fix.away_name,
+                                                new_h, new_a, fix.league_name,
+                                                "-", "", side, clock)
+                                try:
+                                    sent = await app.bot.send_message(
+                                        chat_id=dest, text=text,
+                                        parse_mode="Markdown",
+                                        disable_web_page_preview=True,
+                                    )
+                                    pg = PendingGoal(
+                                        fixture_id=fid, league_slug=fix.league_slug,
+                                        home_name=fix.home_name, away_name=fix.away_name,
+                                        home_score=new_h, away_score=new_a,
+                                        league_name=fix.league_name, elapsed=clock,
+                                        goal_side=side, tg_message=sent,
+                                    )
+                                    pending_goals.append(pg)
+                                    # Lanzar resolución inmediata en paralelo
+                                    asyncio.create_task(_resolve_goal(app, pg))
+                                    logger.info("⚽ Gol detectado: %s %d-%d %s",
+                                                fix.home_name, new_h, new_a, fix.away_name)
+                                except Exception as exc:
+                                    logger.error("Error enviando gol: %s", exc)
+
+                        # ── Livescore channel ──────────────────────────────
+                        if LIVESCORE_CHANNEL_ID:
+                            for _ in range(max(dh + da, 1)):
+                                ls_text = msg_ls_goal(
+                                    fix.home_name, fix.away_name,
+                                    new_h, new_a,
+                                    fix.league_slug, fix.league_name,
+                                    "-", clock, side,
+                                )
+                                try:
+                                    ls_sent = await app.bot.send_message(
+                                        chat_id=LIVESCORE_CHANNEL_ID,
+                                        text=ls_text,
+                                        parse_mode="Markdown",
+                                        disable_web_page_preview=True,
+                                    )
+                                    pg_ls = PendingGoal(
+                                        fixture_id=fid + "_ls",
+                                        league_slug=fix.league_slug,
+                                        home_name=fix.home_name, away_name=fix.away_name,
+                                        home_score=new_h, away_score=new_a,
+                                        league_name=fix.league_name, elapsed=clock,
+                                        goal_side=side, tg_message=ls_sent,
+                                    )
+                                    pending_goals.append(pg_ls)
+                                    asyncio.create_task(_resolve_goal_ls(app, pg_ls, fix))
+                                except Exception as exc:
+                                    logger.error("Error enviando gol livescore: %s", exc)
+
+                        # Registrar gol en goal_log con scorer pendiente
+                        fix.goal_log.append([clock, "Obteniendo...", "goal"])
 
                 # Final
                 if status in ESPN_FINAL and not fix.finished:
@@ -2577,45 +2611,68 @@ async def livescore_loop(app: Application):
                     except Exception as exc:
                         logger.error("ls_loop halftime error: %s", exc)
 
-                # ── GOL ───────────────────────────────────────────────────────
+                # ── GOL / ANULACIÓN ───────────────────────────────────────────
                 if status in ESPN_LIVE and (new_h != st["home_score"] or new_a != st["away_score"]):
                     dh   = new_h - st["home_score"]
                     da   = new_a - st["away_score"]
                     side = "home" if dh > 0 and da == 0 else "away" if da > 0 and dh == 0 else ""
-                    goal_key = f"{clock}_{new_h}_{new_a}"
 
-                    if goal_key not in st["ls_goal_seen"]:
-                        st["ls_goal_seen"].add(goal_key)
+                    # ── ANULACIÓN: el score bajó ──────────────────────────
+                    if dh < 0 or da < 0:
+                        logger.info("🚩 ls_loop gol anulado: %s %d-%d %s",
+                                    home, new_h, new_a, away)
                         st["home_score"] = new_h
                         st["away_score"] = new_a
-
-                        for _ in range(max(dh + da, 1)):
-                            ls_text = msg_ls_goal(
-                                home, away, new_h, new_a,
-                                slug, league,
-                                "Obteniendo...", clock, side,
+                        # Quitar el último gol del goal_log
+                        if st["goal_log"]:
+                            st["goal_log"].pop()
+                        # No hay PendingGoal en ls_loop con referencia directa,
+                        # pero podemos mandar un mensaje de anulación aparte
+                        try:
+                            cancel_text = msg_goal_cancelled(
+                                home, away, new_h, new_a, side, clock,
                             )
-                            try:
-                                sent_msg = await app.bot.send_message(
-                                    chat_id=LIVESCORE_CHANNEL_ID,
-                                    text=ls_text,
-                                    parse_mode="Markdown",
-                                    disable_web_page_preview=True,
-                                )
-                                # Registrar en goal_log con scorer pendiente
-                                entry = [clock, "Obteniendo...", "goal"]
-                                st["goal_log"].append(entry)
+                            await app.bot.send_message(
+                                chat_id=LIVESCORE_CHANNEL_ID,
+                                text=cancel_text,
+                                parse_mode="Markdown",
+                                disable_web_page_preview=True,
+                            )
+                        except Exception as exc:
+                            logger.error("ls_loop anulacion error: %s", exc)
 
-                                # Resolver scorer en background
-                                asyncio.create_task(
-                                    _ls_resolve_scorer(
-                                        app, sent_msg, fid,
-                                        home, away, new_h, new_a,
-                                        slug, league, clock, side, entry,
-                                    )
+                    # ── GOL: el score subió ───────────────────────────────
+                    else:
+                        goal_key = f"{clock}_{new_h}_{new_a}"
+                        if goal_key not in st["ls_goal_seen"]:
+                            st["ls_goal_seen"].add(goal_key)
+                            st["home_score"] = new_h
+                            st["away_score"] = new_a
+
+                            for _ in range(max(dh + da, 1)):
+                                ls_text = msg_ls_goal(
+                                    home, away, new_h, new_a,
+                                    slug, league,
+                                    "Obteniendo...", clock, side,
                                 )
-                            except Exception as exc:
-                                logger.error("ls_loop gol error: %s", exc)
+                                try:
+                                    sent_msg = await app.bot.send_message(
+                                        chat_id=LIVESCORE_CHANNEL_ID,
+                                        text=ls_text,
+                                        parse_mode="Markdown",
+                                        disable_web_page_preview=True,
+                                    )
+                                    entry = [clock, "Obteniendo...", "goal"]
+                                    st["goal_log"].append(entry)
+                                    asyncio.create_task(
+                                        _ls_resolve_scorer(
+                                            app, sent_msg, fid,
+                                            home, away, new_h, new_a,
+                                            slug, league, clock, side, entry,
+                                        )
+                                    )
+                                except Exception as exc:
+                                    logger.error("ls_loop gol error: %s", exc)
 
                 # ── FINAL ─────────────────────────────────────────────────────
                 if status in ESPN_FINAL and not st["finished"]:
